@@ -22,6 +22,73 @@ import numpy as np
 DEFAULT_DATASET = Path(__file__).resolve().parents[2] / "stack_bowl_new_20260805_040218.hdf5"
 ACTION_DIM = 14
 DEFAULT_CHUNK_SIZE = 32  # Server default: training num_frames (33) minus one.
+JOINTS_PER_ARM = 6
+MAX_JOINT_DELTA_RAD = 0.25
+MIN_EE_Z = {
+    "left": 0.2126,
+    "right": 0.2312,
+}
+JOINT_LIMITS_RAD = np.asarray(
+    [
+        (-1.20, 0.70),
+        (-0.40, 2.80),
+        (-2.35, 0.40),
+        (-0.80, 1.20),
+        (-0.70, 0.70),
+        (-1.10, 1.30),
+    ],
+    dtype=np.float32,
+)
+
+
+def end_effector_z(joints: np.ndarray) -> float:
+    """Compute gripper-link Z from the installed R1 Lite URDF chain."""
+    q2, q3, q4, q5 = joints[1:5]
+    q23 = q2 + q3
+    q234 = q23 + q4
+    return float(
+        0.25836
+        + 0.3 * np.sin(q2)
+        - 0.1747 * np.sin(q23)
+        + 0.075485 * np.cos(q23)
+        - np.sin(q234) * (0.08 + 0.104153 * np.cos(q5))
+    )
+
+
+def prepare_replay_targets(
+    action: np.ndarray,
+    current_state: np.ndarray,
+    gripper_min: float,
+    gripper_max: float,
+) -> np.ndarray | None:
+    """Apply PI0.5's joint-delta and end-effector-Z safety checks."""
+    action = np.asarray(action[:ACTION_DIM], dtype=np.float32)
+    joint_delta = np.clip(action[:12], -MAX_JOINT_DELTA_RAD, MAX_JOINT_DELTA_RAD)
+
+    current = np.asarray(current_state, dtype=np.float32)
+    targets = current.copy()
+    targets[:12] += joint_delta
+    targets[12:14] = np.clip(action[12:14], gripper_min, gripper_max)
+
+    for index, side in enumerate(("left", "right")):
+        start = index * JOINTS_PER_ARM
+        stop = start + JOINTS_PER_ARM
+        targets[start:stop] = np.clip(
+            targets[start:stop],
+            JOINT_LIMITS_RAD[:, 0],
+            JOINT_LIMITS_RAD[:, 1],
+        )
+        target_z = end_effector_z(targets[start:stop])
+        current_z = end_effector_z(current[start:stop])
+        if target_z < MIN_EE_Z[side]:
+            print(
+                f"Z BOUNDARY: {side} target {target_z:.3f} m is below "
+                f"{MIN_EE_Z[side]:.3f} m (current {current_z:.3f} m). "
+                "Holding and stopping replay."
+            )
+            return None
+
+    return targets
 
 
 def list_demos(dataset: Path) -> None:
@@ -199,6 +266,7 @@ def main() -> None:
     completed = 0
     chunks_loaded = 0
     failed = False
+    z_boundary_reached = False
     print("EXECUTE ENABLED" if args.execute else "DRY RUN: add --execute to move the robot")
     print("Press Enter to start replay; press Enter again to stop and reset.")
     try:
@@ -245,9 +313,17 @@ def main() -> None:
                     raise RuntimeError("Arm or gripper feedback is missing or stale; stopping replay")
                 tick_started = time.monotonic()
                 measured_before = robot.local_state().copy()
-                target = robot.prepare_targets(
-                    action, args.gripper_min, args.gripper_max, current_state=measured_before
+                target = prepare_replay_targets(
+                    action, measured_before, args.gripper_min, args.gripper_max
                 )
+                if target is None:
+                    z_boundary_reached = True
+                    event_logger.append_event(
+                        run_demo,
+                        "z_boundary",
+                        {"chunk_id": chunk_id, "action_step": action_step},
+                    )
+                    break
                 published = False
                 if args.execute:
                     if not robot.publish_targets_if_enabled(target, hotkey.running):
@@ -277,7 +353,7 @@ def main() -> None:
                     }
                 )
                 completed += 1
-            if not hotkey.running.is_set():
+            if z_boundary_reached or not hotkey.running.is_set():
                 break
         if args.execute:
             robot.hold_current_feedback()
