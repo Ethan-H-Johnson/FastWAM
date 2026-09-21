@@ -1,0 +1,5 @@
+{"event":"demo_started","client_time":"2026-09-19T00:14:35.475+08:00","details":{}}
+{"event":"observation_selected","client_time":"2026-09-19T00:14:35.584+08:00","details":{"chunk_id":1,"timestamps_s":{"head":1789748075.5465257,"left_wrist":1789748075.531968,"right_wrist":1789748075.5364492,"left_arm":1789748075.5418165,"right_arm":1789748075.541849,"left_gripper":1789748075.541836,"right_gripper":1789748075.5418742},"span_ms":14.557600021362305}}
+{"event":"observation_selected","client_time":"2026-09-19T00:14:38.565+08:00","details":{"chunk_id":2,"timestamps_s":{"head":1789748078.5474358,"left_wrist":1789748078.5327022,"right_wrist":1789748078.5038457,"left_arm":1789748078.5469625,"right_arm":1789748078.5469866,"left_gripper":1789748078.5469744,"right_gripper":1789748078.5470014},"span_ms":43.59006881713867}}
+{"event":"demo_stopped","client_time":"2026-09-19T00:14:41.342+08:00","details":{"chunks_queried":2}}
+{"event":"reset_finished","client_time":"2026-09-19T00:14:48.469+08:00","details":{}}

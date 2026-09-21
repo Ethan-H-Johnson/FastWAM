@@ -1,0 +1,3 @@
+{"event":"demo_started","client_time":"2026-09-19T00:13:03.040+08:00","details":{}}
+{"event":"observation_selected","client_time":"2026-09-19T00:13:03.955+08:00","details":{"chunk_id":1,"timestamps_s":{"head":1789747983.9337578,"left_wrist":1789747983.910099,"right_wrist":1789747983.9143615,"left_arm":1789747983.9306636,"right_arm":1789747983.9307098,"left_gripper":1789747983.9306917,"right_gripper":1789747983.9307342},"span_ms":23.65875244140625}}
+{"event":"demo_stopped","client_time":"2026-09-19T00:13:05.564+08:00","details":{"chunks_queried":1}}

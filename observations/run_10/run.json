@@ -1,0 +1,9 @@
+{
+  "control_hz": 20.0,
+  "created_at": "2026-09-02T00:00:59.901+08:00",
+  "execute": true,
+  "host": "r1lite",
+  "num_demos": 2,
+  "prompt": "stack the bowls",
+  "run_id": "run_10"
+}

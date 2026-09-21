@@ -1,0 +1,11 @@
+{
+  "control_hz": 20.0,
+  "created_at": "2026-09-19T01:43:03.133+08:00",
+  "execute": true,
+  "host": "r1lite",
+  "max_observation_age_ms": 250.0,
+  "max_observation_skew_ms": 50.0,
+  "num_demos": 1,
+  "policy_config": "fastwam",
+  "prompt": "stack the bowl"
+}

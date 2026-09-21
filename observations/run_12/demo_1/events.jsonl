@@ -1,0 +1,3 @@
+{"event":"demo_started","client_time":"2026-09-04T02:56:44.876+08:00","details":{}}
+{"event":"demo_stopped","client_time":"2026-09-04T02:58:33.146+08:00","details":{"chunks_queried":36}}
+{"event":"reset_finished","client_time":"2026-09-04T02:58:40.259+08:00","details":{}}
