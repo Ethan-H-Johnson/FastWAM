@@ -317,6 +317,7 @@ class RobotIO(Node):
     def prepare_targets(
         self,
         action: np.ndarray,
+        max_delta: float,
         gripper_min: float,
         gripper_max: float,
         current_state: np.ndarray | None = None,
@@ -325,7 +326,7 @@ class RobotIO(Node):
         if action.shape != (ACTION_DIM,) or not np.isfinite(action).all():
             raise ValueError(f"Expected one finite {ACTION_DIM}-D action, got {action.shape}")
         target = self.local_state() if current_state is None else np.asarray(current_state, dtype=np.float32).copy()
-        target[:12] += action[:12]
+        target[:12] += np.clip(action[:12], -max_delta, max_delta)
         target[:6] = np.clip(target[:6], JOINT_LIMITS_RAD[:, 0], JOINT_LIMITS_RAD[:, 1])
         target[6:12] = np.clip(target[6:12], JOINT_LIMITS_RAD[:, 0], JOINT_LIMITS_RAD[:, 1])
         target[12:14] = np.clip(action[12:14], gripper_min, gripper_max)
@@ -856,6 +857,7 @@ def parse_args() -> argparse.Namespace:
         default="fastwam",
         help="Directory name identifying the served FastWAM policy/config",
     )
+    parser.add_argument("--max-joint-delta", type=float, default=0.25)
     parser.add_argument("--gripper-min", type=float, default=0.0)
     parser.add_argument("--gripper-max", type=float, default=100.0)
     parser.add_argument("--wrist-transport", choices=("raw", "compressed"), default="raw")
@@ -1035,6 +1037,7 @@ def main() -> None:
             measured_before = robot.local_state().copy()
             target = robot.prepare_targets(
                 action,
+                args.max_joint_delta,
                 args.gripper_min,
                 args.gripper_max,
                 current_state=measured_before,
