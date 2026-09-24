@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Run a workstation-hosted FastWAM policy from a Galaxea R1 Lite ROS 2 PC.
 
-The workstation returns [d_left_6, d_right_6, left_gripper, right_gripper].
-This client integrates only arm deltas over fresh feedback, publishes absolute
-gripper targets, and holds the last target while the next action chunk arrives.
+The client supports absolute or relative arm outputs, publishes absolute
+gripper targets, and holds the last target while the next chunk arrives.
+The selected mode must match the action contract reported by the server.
 """
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ from urllib.request import Request, urlopen
 
 import cv2
 from cv_bridge import CvBridge
+import h5py
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -103,8 +104,67 @@ class ObservationBundle:
     sample_timestamps_s: dict[str, float]
 
 
+class CommandPublishLogger:
+    """Write every ROS target publication without blocking the control thread."""
+
+    def __init__(self, session: RolloutSession) -> None:
+        self.path = session.root / "command_publications.jsonl"
+        self.pending: queue.Queue[dict[str, object] | None] = queue.Queue(maxsize=10000)
+        self.dropped = 0
+        self.worker = threading.Thread(target=self._run, name="command-publish-logger", daemon=True)
+        self.worker.start()
+
+    def submit(
+        self,
+        source: str,
+        target: np.ndarray,
+        demo_id: str | None,
+        chunk_id: int | None,
+        action_step: int | None,
+    ) -> None:
+        record = {
+            "monotonic_ns": time.monotonic_ns(),
+            "wall_time": wall_time(),
+            "source": source,
+            "demo_id": demo_id,
+            "chunk_id": chunk_id,
+            "action_step": action_step,
+            "target": np.asarray(target, dtype=np.float32).tolist(),
+        }
+        try:
+            self.pending.put_nowait(record)
+        except queue.Full:
+            self.dropped += 1
+
+    def _run(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8", buffering=1) as stream:
+            while True:
+                record = self.pending.get()
+                try:
+                    if record is None:
+                        return
+                    stream.write(json.dumps(record, separators=(",", ":")) + "\n")
+                finally:
+                    self.pending.task_done()
+
+    def close(self) -> None:
+        self.pending.join()
+        if self.dropped:
+            print(f"COMMAND_PUBLISH_LOG_DROPPED: {self.dropped}")
+        self.pending.put(None)
+        self.worker.join()
+
+
 class RobotIO(Node):
-    def __init__(self, wrist_transport: str, hold_hz: float, observation_buffer_s: float, video_recorder: "TrajectoryRecorder") -> None:
+    def __init__(
+        self,
+        wrist_transport: str,
+        hold_hz: float,
+        observation_buffer_s: float,
+        video_recorder: "TrajectoryRecorder",
+        publish_logger: CommandPublishLogger | None = None,
+    ) -> None:
         super().__init__("r1lite_fastwam_inference")
         self.bridge = CvBridge()
         self.arm: dict[str, np.ndarray | None] = {"left": None, "right": None}
@@ -129,6 +189,11 @@ class RobotIO(Node):
         self._hold_enabled = threading.Event()
         self._hold_closed = threading.Event()
         self._hold_hz = hold_hz
+        self._publish_logger = publish_logger
+        self._active_demo_id: str | None = None
+        self._last_target_chunk_id: int | None = None
+        self._last_target_action_step: int | None = None
+        self._arm_feedback_sequence = {"left": 0, "right": 0}
 
         qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=1)
         for side, topic in ARM_FEEDBACK_TOPICS.items():
@@ -171,6 +236,7 @@ class RobotIO(Node):
             if len(message.position) >= JOINTS_PER_ARM:
                 self.arm[side] = np.asarray(message.position[:JOINTS_PER_ARM], dtype=np.float32)
                 self.arm_names[side] = list(message.name[:JOINTS_PER_ARM])
+                self._arm_feedback_sequence[side] += 1
                 self._append_sample(f"{side}_arm", self._message_timestamp_s(message), self.arm[side])
         return callback
 
@@ -317,7 +383,6 @@ class RobotIO(Node):
     def prepare_targets(
         self,
         action: np.ndarray,
-        max_delta: float,
         gripper_min: float,
         gripper_max: float,
         current_state: np.ndarray | None = None,
@@ -326,13 +391,69 @@ class RobotIO(Node):
         if action.shape != (ACTION_DIM,) or not np.isfinite(action).all():
             raise ValueError(f"Expected one finite {ACTION_DIM}-D action, got {action.shape}")
         target = self.local_state() if current_state is None else np.asarray(current_state, dtype=np.float32).copy()
-        target[:12] += np.clip(action[:12], -max_delta, max_delta)
+        target[:12] += action[:12]
         target[:6] = np.clip(target[:6], JOINT_LIMITS_RAD[:, 0], JOINT_LIMITS_RAD[:, 1])
         target[6:12] = np.clip(target[6:12], JOINT_LIMITS_RAD[:, 0], JOINT_LIMITS_RAD[:, 1])
         target[12:14] = np.clip(action[12:14], gripper_min, gripper_max)
         return target
 
-    def _publish_targets_locked(self, target: np.ndarray) -> None:
+    def prepare_absolute_targets(
+        self,
+        target: np.ndarray,
+        gripper_min: float,
+        gripper_max: float,
+    ) -> np.ndarray:
+        """Clip an already-absolute 14-D target to safety limits, with no add."""
+        target = np.asarray(target, dtype=np.float32).copy()
+        if target.shape != (ACTION_DIM,) or not np.isfinite(target).all():
+            raise ValueError(f"Expected one finite {ACTION_DIM}-D target, got {target.shape}")
+        target[:6] = np.clip(target[:6], JOINT_LIMITS_RAD[:, 0], JOINT_LIMITS_RAD[:, 1])
+        target[6:12] = np.clip(target[6:12], JOINT_LIMITS_RAD[:, 0], JOINT_LIMITS_RAD[:, 1])
+        target[12:14] = np.clip(target[12:14], gripper_min, gripper_max)
+        return target
+
+    def set_active_demo(self, demo_id: str) -> None:
+        with self._command_lock:
+            self._active_demo_id = demo_id
+
+    def wait_for_right_arm_convergence(
+        self,
+        target: np.ndarray,
+        enabled: threading.Event,
+        minimum_wait_s: float,
+        timeout_s: float,
+        tolerance_rad: float,
+        consecutive_samples: int,
+    ) -> tuple[bool, float, float]:
+        """Wait for fresh right-arm feedback to converge on one published target."""
+        started = time.monotonic()
+        deadline = started + max(minimum_wait_s, timeout_s)
+        last_sequence = self._arm_feedback_sequence["right"]
+        consecutive = 0
+        max_error = float("inf")
+
+        while rclpy.ok() and enabled.is_set():
+            now = time.monotonic()
+            if now >= deadline:
+                break
+            self.spin_for(min(0.01, deadline - now))
+            if time.monotonic() - started < minimum_wait_s:
+                continue
+            sequence = self._arm_feedback_sequence["right"]
+            if sequence == last_sequence:
+                continue
+            last_sequence = sequence
+            measured = self.local_state()[6:12]
+            max_error = float(np.max(np.abs(measured - target[6:12])))
+            consecutive = consecutive + 1 if max_error <= tolerance_rad else 0
+            if consecutive >= consecutive_samples:
+                return True, time.monotonic() - started, max_error
+
+        if np.isinf(max_error):
+            max_error = float(np.max(np.abs(self.local_state()[6:12] - target[6:12])))
+        return False, time.monotonic() - started, max_error
+
+    def _publish_targets_locked(self, target: np.ndarray, source: str) -> None:
         stamp = self.get_clock().now().to_msg()
         for arm_index, side in enumerate(("left", "right")):
             start = arm_index * JOINTS_PER_ARM
@@ -345,20 +466,38 @@ class RobotIO(Node):
             gripper.header.stamp = stamp
             gripper.position = [float(target[12 + arm_index])]
             self.gripper_publishers[side].publish(gripper)
+        if self._publish_logger is not None:
+            self._publish_logger.submit(
+                source,
+                target,
+                self._active_demo_id,
+                self._last_target_chunk_id,
+                self._last_target_action_step,
+            )
 
     def publish_targets(self, target: np.ndarray) -> None:
         target = np.asarray(target, dtype=np.float32).copy()
         with self._command_lock:
             self._last_targets = target
-            self._publish_targets_locked(target)
+            self._last_target_chunk_id = None
+            self._last_target_action_step = None
+            self._publish_targets_locked(target, "direct")
 
-    def publish_targets_if_enabled(self, target: np.ndarray, enabled: threading.Event) -> bool:
+    def publish_targets_if_enabled(
+        self,
+        target: np.ndarray,
+        enabled: threading.Event,
+        chunk_id: int | None = None,
+        action_step: int | None = None,
+    ) -> bool:
         target = np.asarray(target, dtype=np.float32).copy()
         with self._command_lock:
             if not enabled.is_set():
                 return False
             self._last_targets = target
-            self._publish_targets_locked(target)
+            self._last_target_chunk_id = chunk_id
+            self._last_target_action_step = action_step
+            self._publish_targets_locked(target, "action_step")
         return True
 
     def start_hold(self) -> bool:
@@ -368,7 +507,7 @@ class RobotIO(Node):
                     self._last_targets = self.local_state().copy()
                 except RuntimeError:
                     return False
-            self._publish_targets_locked(self._last_targets)
+            self._publish_targets_locked(self._last_targets, "hold_start")
         self._hold_enabled.set()
         return True
 
@@ -378,7 +517,9 @@ class RobotIO(Node):
                 self._last_targets = self.local_state().copy()
             except RuntimeError:
                 return False
-            self._publish_targets_locked(self._last_targets)
+            self._last_target_chunk_id = None
+            self._last_target_action_step = None
+            self._publish_targets_locked(self._last_targets, "hold_current_feedback")
         self._hold_enabled.set()
         return True
 
@@ -399,7 +540,7 @@ class RobotIO(Node):
             tick_started = time.monotonic()
             with self._command_lock:
                 if self._last_targets is not None:
-                    self._publish_targets_locked(self._last_targets)
+                    self._publish_targets_locked(self._last_targets, "hold_thread")
             remaining = period - (time.monotonic() - tick_started)
             if remaining > 0:
                 self._hold_closed.wait(remaining)
@@ -579,19 +720,29 @@ class ActionStepLogger:
                     "target": np.round(target, 3).tolist(),
                     "measured": np.round(after, 3).tolist(),
                     "error": np.round(target - after, 3).tolist(),
-                    "delta": np.round(action[:12], 3).tolist(),
+                    "model_arm_output": np.round(action[:12], 3).tolist(),
+                    "action_mode": str(record["action_mode"]),
                 }
                 feedback = {
                     "chunk_id": int(record["chunk_id"]),
                     "action_step": int(record["action_step"]),
                     "client_time": str(record["client_time"]),
                     "model_action": action.tolist(),
+                    "action_mode": str(record["action_mode"]),
                     "commanded_position": target.tolist(),
                     "measured_before": measured_before.tolist(),
                     "measured_after": after.tolist(),
                     "delta_error": (after - target).tolist(),
                     "published": bool(record["published"]),
                     "tick_duration_s": float(record["tick_duration_s"]),
+                    "convergence_enabled": bool(record.get("convergence_enabled", False)),
+                    "settled": record.get("settled"),
+                    "settle_elapsed_s": float(record.get("settle_elapsed_s", 0.0)),
+                    "right_arm_max_error_rad": (
+                        None
+                        if record.get("right_arm_max_error_rad") is None
+                        else float(record["right_arm_max_error_rad"])
+                    ),
                 }
                 key = (str(record["run_id"]), str(record["demo_id"]))
                 with self.records_lock:
@@ -814,19 +965,181 @@ class ClientObservationRecorder:
             stream.write(json.dumps(record, separators=(",", ":")) + "\n")
 
 
-def request_actions(endpoint: str, payload: dict[str, object], timeout_s: float) -> np.ndarray:
+def request_actions(
+    endpoint: str,
+    payload: dict[str, object],
+    timeout_s: float,
+    expected_action_mode: str,
+) -> np.ndarray:
     result = post_json(endpoint, payload, timeout_s)
+    server_action_mode = str(result.get("action_semantics", "relative"))
+    if server_action_mode != expected_action_mode:
+        raise RuntimeError(
+            "Client/server action-mode mismatch: "
+            f"client={expected_action_mode!r}, server={server_action_mode!r}"
+        )
     actions = np.asarray(result.get("actions"), dtype=np.float32)
     if actions.ndim != 2 or actions.shape[1] != ACTION_DIM or not np.isfinite(actions).all():
         raise RuntimeError(f"Policy returned invalid actions: {actions.shape}")
     return actions
 
 
+def request_actions_while_spinning(
+    robot: RobotIO,
+    endpoint: str,
+    payload: dict[str, object],
+    timeout_s: float,
+    expected_action_mode: str,
+) -> np.ndarray:
+    """Run the blocking HTTP request without stopping ROS feedback callbacks.
+
+    Target holding remains owned by ``RobotIO._hold_loop``. The main thread
+    keeps spinning this node until the inference worker finishes, so camera and
+    joint feedback continue to update throughout the server request.
+    """
+    result_queue: queue.Queue[tuple[np.ndarray | None, BaseException | None]] = queue.Queue(maxsize=1)
+
+    def infer() -> None:
+        try:
+            result_queue.put(
+                (request_actions(endpoint, payload, timeout_s, expected_action_mode), None)
+            )
+        except BaseException as exc:  # Propagate the original request failure on the main thread.
+            result_queue.put((None, exc))
+
+    worker = threading.Thread(target=infer, name="fastwam-inference-request", daemon=True)
+    worker.start()
+    while worker.is_alive():
+        robot.spin_for(0.01)
+        if not rclpy.ok():
+            time.sleep(0.01)
+    worker.join()
+
+    actions, error = result_queue.get_nowait()
+    if error is not None:
+        raise error
+    assert actions is not None
+    return actions
+
+
+def load_replay_actions(path: Path, demo_name: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+    """Load one HDF5 demo's actions in two forms:
+
+    - relative: arm deltas from ``actions``, absolute gripper targets from
+      ``absolute_actions`` (the model's own convention; see
+      serve_fastwam_r1lite.py's action_semantics).
+    - absolute: the recorded ``absolute_actions`` targets exactly as
+      commanded during collection, for all 14 dims.
+    """
+    demo_name = demo_name if demo_name.startswith("demo_") else f"demo_{demo_name}"
+    with h5py.File(path, "r") as file:
+        key = f"data/{demo_name}"
+        if key not in file:
+            available = sorted(file.get("data", {}).keys())
+            raise KeyError(f"{demo_name!r} is not in {path}. Available demos: {available}")
+        demo = file[key]
+        if "actions" not in demo or "absolute_actions" not in demo or "joint_states" not in demo:
+            raise KeyError(f"{key} must contain actions, absolute_actions, and joint_states")
+        actions = np.asarray(demo["actions"], dtype=np.float32)
+        absolute_actions = np.asarray(demo["absolute_actions"], dtype=np.float32)
+        initial_state = np.asarray(demo["joint_states"][0], dtype=np.float32)
+        task = str(demo.attrs.get("task_description", demo.attrs.get("subtask_key", "unknown")))
+
+    if actions.shape != absolute_actions.shape or actions.ndim != 2 or actions.shape[1] < ACTION_DIM:
+        raise ValueError(f"Expected actions/absolute_actions shaped [T, >={ACTION_DIM}], got {actions.shape}")
+    if initial_state.shape != (ACTION_DIM,):
+        raise ValueError(f"Expected a {ACTION_DIM}-D initial joint state, got {initial_state.shape}")
+
+    absolute_targets = absolute_actions[:, :ACTION_DIM].copy()
+    relative_actions = actions[:, :ACTION_DIM].copy()
+    relative_actions[:, 12:14] = absolute_targets[:, 12:14]
+    if not np.isfinite(relative_actions).all() or not np.isfinite(absolute_targets).all() or not np.isfinite(initial_state).all():
+        raise ValueError("The selected demo contains non-finite state or action values")
+    return relative_actions, absolute_targets, initial_state, task
+
+
+def move_to_replay_start(
+    robot: RobotIO,
+    hotkey: EnterHotkey,
+    target: np.ndarray,
+    args: argparse.Namespace,
+) -> bool:
+    start = robot.local_state().copy()
+    print("Replay initial state:", np.array2string(target, precision=4, suppress_small=True))
+    print(
+        f"Moving to it over {args.replay_initial_move_s:.1f}s; "
+        f"maximum arm travel={np.max(np.abs(target[:12] - start[:12])):.4f} rad"
+    )
+    if not args.execute:
+        print("DRY RUN: no initial-position targets published.")
+        return True
+
+    steps = max(1, int(np.ceil(args.replay_initial_move_s * args.control_hz)))
+    period = 1.0 / args.control_hz
+    for step in range(1, steps + 1):
+        if not hotkey.running.is_set():
+            return False
+        tick_started = time.monotonic()
+        command = start + (step / steps) * (target - start)
+        if not robot.publish_targets_if_enabled(command, hotkey.running):
+            return False
+        robot.start_hold()
+        remaining = period - (time.monotonic() - tick_started)
+        if remaining > 0:
+            robot.spin_for(remaining)
+
+    robot.spin_for(0.3)
+    measured = robot.local_state().copy()
+    arm_error = float(np.max(np.abs(measured[:12] - target[:12])))
+    gripper_error = float(np.max(np.abs(measured[12:14] - target[12:14])))
+    print(f"Replay initial-pose error: arms={arm_error:.5f} rad, grippers={gripper_error:.3f}")
+    if arm_error > args.replay_initial_arm_tolerance or gripper_error > args.replay_initial_gripper_tolerance:
+        raise RuntimeError(
+            "Robot did not reach the replay demo's initial pose: limits are "
+            f"{args.replay_initial_arm_tolerance:.3f} rad and "
+            f"{args.replay_initial_gripper_tolerance:.3f} gripper units"
+        )
+    return hotkey.running.is_set()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--server", required=True, help="e.g. http://192.168.1.10:8000")
+    parser.add_argument(
+        "--server", default=None, help="e.g. http://192.168.1.10:8000 (required unless --replay-hdf5 is set)"
+    )
     parser.add_argument("--prompt", required=True)
+    parser.add_argument(
+        "--replay-hdf5",
+        type=Path,
+        default=None,
+        help="Replay one HDF5 demo's stored actions instead of querying a FastWAM server",
+    )
+    parser.add_argument(
+        "--replay-demo", default="demo_0", help="Demo to replay when --replay-hdf5 is set, e.g. demo_12 or 12"
+    )
+    parser.add_argument(
+        "--replay-mode",
+        choices=("relative", "absolute"),
+        default="relative",
+        help=(
+            "relative (default): apply the model's own convention (arm deltas onto live "
+            "feedback, absolute gripper) each step. absolute: republish the recorded "
+            "absolute_actions target exactly, ignoring live feedback for target computation."
+        ),
+    )
+    parser.add_argument("--replay-initial-move-s", type=float, default=5.0)
+    parser.add_argument("--replay-initial-arm-tolerance", type=float, default=0.12)
+    parser.add_argument("--replay-initial-gripper-tolerance", type=float, default=15.0)
     parser.add_argument("--execute", action="store_true", help="Publish targets; default is dry-run")
+    parser.add_argument(
+        "--action-mode",
+        choices=("relative", "absolute"),
+        default="absolute",
+        help=(
+            "How to interpret live model arm outputs. relative adds the first 12 values "
+            "to live feedback; absolute publishes all 14 values as absolute targets."
+        ),
+    )
     parser.add_argument(
         "--control-hz",
         type=float,
@@ -838,6 +1151,29 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Actions to execute per query; default executes the complete horizon returned by the trained server",
+    )
+    parser.add_argument(
+        "--wait-for-convergence",
+        action="store_true",
+        help="Wait after each action until the right arm reaches its target or the settle timeout expires",
+    )
+    parser.add_argument(
+        "--settle-tolerance-deg",
+        type=float,
+        default=2.0,
+        help="Maximum right-arm joint error considered settled (default: 2 degrees)",
+    )
+    parser.add_argument(
+        "--settle-timeout-s",
+        type=float,
+        default=0.25,
+        help="Maximum total time allowed for each action step in convergence mode (default: 0.25 s)",
+    )
+    parser.add_argument(
+        "--settle-consecutive-samples",
+        type=int,
+        default=2,
+        help="Fresh in-tolerance feedback samples required before advancing (default: 2)",
     )
     parser.add_argument("--request-timeout", type=float, default=30.0)
     parser.add_argument(
@@ -857,7 +1193,6 @@ def parse_args() -> argparse.Namespace:
         default="fastwam",
         help="Directory name identifying the served FastWAM policy/config",
     )
-    parser.add_argument("--max-joint-delta", type=float, default=0.25)
     parser.add_argument("--gripper-min", type=float, default=0.0)
     parser.add_argument("--gripper-max", type=float, default=100.0)
     parser.add_argument("--wrist-transport", choices=("raw", "compressed"), default="raw")
@@ -885,15 +1220,30 @@ def main() -> None:
     if (
         args.control_hz <= 0
         or (args.replan_steps is not None and args.replan_steps <= 0)
-        or args.max_joint_delta <= 0
         or args.gripper_min > args.gripper_max
         or args.max_observation_skew_ms <= 0
         or args.observation_buffer_s <= 0
         or args.max_observation_age_ms <= 0
+        or args.settle_tolerance_deg <= 0
+        or args.settle_timeout_s <= 0
+        or args.settle_consecutive_samples <= 0
     ):
         raise ValueError("Invalid control, replan, delta, or gripper limits")
-    server = args.server.rstrip("/")
-    endpoint, period = server + "/infer", 1.0 / args.control_hz
+    if args.replay_hdf5 is None and args.server is None:
+        raise ValueError("--server is required unless --replay-hdf5 is set")
+    server = args.server.rstrip("/") if args.server else None
+    endpoint = server + "/infer" if server else None
+    period = 1.0 / args.control_hz
+    replay_actions = replay_initial_state = replay_task = None
+    if args.replay_hdf5 is not None:
+        relative_actions, absolute_targets, replay_initial_state, replay_task = load_replay_actions(
+            args.replay_hdf5, args.replay_demo
+        )
+        replay_actions = relative_actions if args.replay_mode == "relative" else absolute_targets
+        print(
+            f"Replay source: {args.replay_hdf5} [{args.replay_demo}] ({replay_task}); "
+            f"{len(replay_actions)} actions; mode={args.replay_mode}"
+        )
     num_demos = ask_num_demos()
     session = RolloutSession.create(
         args.rollouts_dir,
@@ -904,36 +1254,61 @@ def main() -> None:
             "num_demos": num_demos,
             "execute": args.execute,
             "control_hz": args.control_hz,
+            "wait_for_convergence": args.wait_for_convergence,
+            "settle_tolerance_deg": args.settle_tolerance_deg,
+            "settle_timeout_s": args.settle_timeout_s,
+            "settle_consecutive_samples": args.settle_consecutive_samples,
             "max_observation_skew_ms": args.max_observation_skew_ms,
             "max_observation_age_ms": args.max_observation_age_ms,
             "created_at": wall_time(),
             "host": os.uname().nodename,
+            "replay_hdf5": str(args.replay_hdf5) if args.replay_hdf5 else None,
+            "replay_demo": args.replay_demo if args.replay_hdf5 else None,
         },
     )
-    run_response = post_json(
-        server + "/runs/start",
-        {
-            "prompt": args.prompt,
-            "num_demos": num_demos,
-            "execute": args.execute,
-            "control_hz": args.control_hz,
-        },
-        args.request_timeout,
-    )
-    run_id = str(run_response["run_id"])
+    if args.replay_hdf5 is not None:
+        run_id = f"replay_{_safe_path_component(args.replay_demo)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    else:
+        run_response = post_json(
+            server + "/runs/start",
+            {
+                "prompt": args.prompt,
+                "num_demos": num_demos,
+                "execute": args.execute,
+                "control_hz": args.control_hz,
+            },
+            args.request_timeout,
+        )
+        run_id = str(run_response["run_id"])
     observation_recorder = ClientObservationRecorder(session)
+    publish_logger = CommandPublishLogger(session)
     action_queue: deque[tuple[int, int, np.ndarray]] = deque()
     rclpy.init()
     video_recorder = TrajectoryRecorder()
-    robot = RobotIO(args.wrist_transport, max(args.control_hz, 20.0), args.observation_buffer_s, video_recorder)
+    robot = RobotIO(
+        args.wrist_transport,
+        max(args.control_hz, 20.0),
+        args.observation_buffer_s,
+        video_recorder,
+        publish_logger,
+    )
     step_logger = ActionStepLogger(session)
     image_logger = ObservationImageLogger(args.observations_dir)
     print("EXECUTE ENABLED" if args.execute else "DRY RUN: add --execute to move the robot")
     replan_description = args.replan_steps if args.replan_steps is not None else "full trained horizon"
-    print(
-        f"FastWAM server: {endpoint}; replan steps: {replan_description}; "
-        f"max observation skew: {args.max_observation_skew_ms:.1f} ms"
-    )
+    if args.replay_hdf5 is not None:
+        print(f"REPLAY MODE: {args.replay_hdf5} [{args.replay_demo}]; replan steps: {replan_description}")
+    else:
+        print(
+            f"FastWAM server: {endpoint}; replan steps: {replan_description}; "
+            f"max observation skew: {args.max_observation_skew_ms:.1f} ms"
+        )
+    if args.wait_for_convergence:
+        print(
+            "CONVERGENCE MODE: right-arm error <= "
+            f"{args.settle_tolerance_deg:.2f} deg for {args.settle_consecutive_samples} fresh samples; "
+            f"per-step timeout {args.settle_timeout_s:.3f}s."
+        )
     print(f"Recording {num_demos} demos under {session.root}.")
     print("Press Enter to start demo_1. Press Enter again to stop and reset.")
 
@@ -941,6 +1316,7 @@ def main() -> None:
     inference_started = False
     completed_demos = 0
     chunk_id = 0
+    replay_index = 0
 
     def current_demo_id() -> str:
         return f"demo_{completed_demos + 1}"
@@ -985,9 +1361,34 @@ def main() -> None:
             if not inference_started:
                 inference_started = True
                 chunk_id = 0
+                robot.set_active_demo(current_demo_id())
                 video_recorder.start_demo(session.demo_dir(current_demo_id()))
                 log_event("demo_started")
                 print(f"{current_demo_id()} inference started.")
+                if args.replay_hdf5 is not None:
+                    replay_index = 0
+                    if not move_to_replay_start(robot, hotkey, replay_initial_state, args):
+                        continue
+
+            if not action_queue and args.replay_hdf5 is not None:
+                n_execute = len(replay_actions) - replay_index
+                if args.replan_steps is not None:
+                    n_execute = min(n_execute, args.replan_steps)
+                if n_execute <= 0:
+                    print("Replay demo exhausted; stopping.")
+                    if args.execute:
+                        robot.hold_current_feedback()
+                    hotkey.running.clear()
+                    continue
+                chunk_id += 1
+                chunk = replay_actions[replay_index : replay_index + n_execute]
+                replay_index += n_execute
+                action_queue.extend(
+                    (chunk_id, action_step, action.copy())
+                    for action_step, action in enumerate(chunk, start=1)
+                )
+                print(f"Replaying actions {replay_index - n_execute + 1}-{replay_index}/{len(replay_actions)}")
+                robot.spin_for(0.05)
 
             if not action_queue:
                 robot.spin_for(0.10)
@@ -1010,10 +1411,15 @@ def main() -> None:
                     "chunk_id": chunk_id, "timestamps_s": observation.sample_timestamps_s,
                     "span_ms": 1000.0 * (max(observation.sample_timestamps_s.values()) - min(observation.sample_timestamps_s.values())),
                 })
-                actions = request_actions(
+                if args.execute and robot.held_targets() is None:
+                    if not robot.hold_current_feedback():
+                        raise RuntimeError("Could not establish the initial hold target before inference")
+                actions = request_actions_while_spinning(
+                    robot,
                     endpoint,
                     payload,
                     args.request_timeout,
+                    args.action_mode,
                 )
                 n_execute = len(actions) if args.replan_steps is None else min(args.replan_steps, len(actions))
                 if not hotkey.running.is_set():
@@ -1025,7 +1431,7 @@ def main() -> None:
                 )
                 print(f"Received {len(actions)} actions in {time.monotonic() - started:.3f}s; executing {n_execute}.")
 
-                # Refresh feedback accumulated during the blocking request.
+                # Allow any callbacks queued at request completion to run.
                 robot.spin_for(0.05)
 
             if not hotkey.running.is_set():
@@ -1035,25 +1441,51 @@ def main() -> None:
             tick_started = time.monotonic()
             queued_chunk_id, action_step, action = action_queue.popleft()
             measured_before = robot.local_state().copy()
-            target = robot.prepare_targets(
-                action,
-                args.max_joint_delta,
-                args.gripper_min,
-                args.gripper_max,
-                current_state=measured_before,
-            )
+            if (
+                (args.replay_hdf5 is not None and args.replay_mode == "absolute")
+                or (args.replay_hdf5 is None and args.action_mode == "absolute")
+            ):
+                target = robot.prepare_absolute_targets(action, args.gripper_min, args.gripper_max)
+            else:
+                target = robot.prepare_targets(
+                    action,
+                    args.gripper_min,
+                    args.gripper_max,
+                    current_state=measured_before,
+                )
             published = False
             if args.execute:
-                if not robot.publish_targets_if_enabled(target, hotkey.running):
+                if not robot.publish_targets_if_enabled(
+                    target,
+                    hotkey.running,
+                    chunk_id=queued_chunk_id,
+                    action_step=action_step,
+                ):
                     action_queue.clear()
                     continue
                 robot.start_hold()
                 published = True
             else:
                 print("[dry-run] target=", np.array2string(target, precision=4))
-            remaining = period - (time.monotonic() - tick_started)
-            if remaining > 0:
-                robot.spin_for(remaining)
+            settled: bool | None = None
+            settle_elapsed_s = 0.0
+            right_arm_max_error_rad: float | None = None
+            if args.execute and args.wait_for_convergence:
+                settled, settle_elapsed_s, right_arm_max_error_rad = robot.wait_for_right_arm_convergence(
+                    target,
+                    hotkey.running,
+                    minimum_wait_s=period,
+                    timeout_s=args.settle_timeout_s,
+                    tolerance_rad=np.deg2rad(args.settle_tolerance_deg),
+                    consecutive_samples=args.settle_consecutive_samples,
+                )
+                if not hotkey.running.is_set():
+                    action_queue.clear()
+                    continue
+            else:
+                remaining = period - (time.monotonic() - tick_started)
+                if remaining > 0:
+                    robot.spin_for(remaining)
             measured_after = robot.local_state().copy()
             step_logger.submit(
                 {
@@ -1063,11 +1495,16 @@ def main() -> None:
                     "action_step": action_step,
                     "client_time": wall_time(),
                     "model_action": action.tolist(),
+                    "action_mode": args.action_mode,
                     "measured_before": measured_before.tolist(),
                     "commanded_target": target.tolist(),
                     "measured_after": measured_after.tolist(),
                     "published": published,
                     "tick_duration_s": time.monotonic() - tick_started,
+                    "convergence_enabled": args.wait_for_convergence,
+                    "settled": settled,
+                    "settle_elapsed_s": settle_elapsed_s,
+                    "right_arm_max_error_rad": right_arm_max_error_rad,
                 }
             )
     except KeyboardInterrupt:
@@ -1086,10 +1523,11 @@ def main() -> None:
         failed = False
     finally:
         hotkey.close()
+        robot.close()
+        publish_logger.close()
         video_recorder.close()
         step_logger.close()
         image_logger.close()
-        robot.close()
         robot.destroy_node()
         rclpy.shutdown()
 

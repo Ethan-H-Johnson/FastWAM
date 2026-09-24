@@ -12,16 +12,16 @@ import numpy as np
 
 import inference_r1lite_fastwam as client
 
-# runs/right_arm_stack_bowl_absolute/dataset_stats.json:
+# runs/right_arm_stack_bowl/dataset_stats.json:
 # state.default.global_mean[0:6]
 NEUTRAL_LEFT_ARM = np.asarray(
     [
-        0.0000333646203,
-        -0.00127659552,
-        -0.00312794046,
-        -0.00306047522,
-        0.0000421615478,
-        -0.00299278600,
+        0.0000316732185,
+        -0.00136027753,
+        -0.00314065046,
+        -0.00299898861,
+        -0.0000740331598,
+        -0.00302747544,
     ],
     dtype=np.float32,
 )

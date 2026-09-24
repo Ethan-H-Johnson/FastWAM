@@ -46,10 +46,11 @@ from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_js
 
 LOGGER = logging.getLogger("fastwam.r1lite.server")
 STATE_DIM = ACTION_DIM = 14
+# Saving run purposes
 RUN_ID_PATTERN = r"^run_[1-9][0-9]*$"
 DEMO_ID_PATTERN = r"^demo_[1-9][0-9]*$"
 
-
+# HTTP payload schemes
 class InferenceRequest(BaseModel):
     """Current feedback plus base64 JPEG/PNG RGB images."""
 
@@ -68,28 +69,6 @@ class StartRunRequest(BaseModel):
     num_demos: Annotated[int, Field(ge=1)]
     execute: bool
     control_hz: Annotated[float, Field(gt=0)]
-
-
-class DemoEventRequest(BaseModel):
-    run_id: Annotated[str, Field(pattern=RUN_ID_PATTERN)]
-    demo_id: Annotated[str, Field(pattern=DEMO_ID_PATTERN)]
-    event: Annotated[str, Field(min_length=1)]
-    client_time: str
-    details: dict[str, Any] = Field(default_factory=dict)
-
-
-class ActionStepRequest(BaseModel):
-    run_id: Annotated[str, Field(pattern=RUN_ID_PATTERN)]
-    demo_id: Annotated[str, Field(pattern=DEMO_ID_PATTERN)]
-    chunk_id: Annotated[int, Field(ge=1)]
-    action_step: Annotated[int, Field(ge=1)]
-    client_time: str
-    model_action: Annotated[list[float], Field(min_length=ACTION_DIM, max_length=ACTION_DIM)]
-    measured_before: Annotated[list[float], Field(min_length=STATE_DIM, max_length=STATE_DIM)]
-    commanded_target: Annotated[list[float], Field(min_length=STATE_DIM, max_length=STATE_DIM)]
-    measured_after: Annotated[list[float], Field(min_length=STATE_DIM, max_length=STATE_DIM)]
-    published: bool
-    tick_duration_s: Annotated[float, Field(ge=0)]
 
 
 def _wall_time() -> str:
@@ -153,32 +132,6 @@ class ObservationRecorder:
             )
         return run_id
 
-    def append_event(self, request: DemoEventRequest) -> None:
-        record = {"server_time": _wall_time(), **request.model_dump()}
-        with self.lock:
-            path = self._demo_dir(request.run_id, request.demo_id) / "events.jsonl"
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record) + "\n")
-
-    def append_action_step(self, request: ActionStepRequest) -> None:
-        record = request.model_dump()
-        model_action = np.asarray(request.model_action, dtype=np.float32)
-        measured_before = np.asarray(request.measured_before, dtype=np.float32)
-        measured_after = np.asarray(request.measured_after, dtype=np.float32)
-        commanded = np.asarray(request.commanded_target, dtype=np.float32)
-        record["model_arm_delta"] = model_action[:12].tolist()
-        record["model_gripper_absolute"] = model_action[12:14].tolist()
-        record["applied_arm_delta_after_clipping"] = (commanded[:12] - measured_before[:12]).tolist()
-        record["commanded_arm_absolute"] = commanded[:12].tolist()
-        record["commanded_gripper_absolute"] = commanded[12:14].tolist()
-        record["measured_after_arm"] = measured_after[:12].tolist()
-        record["measured_after_gripper"] = measured_after[12:14].tolist()
-        record["tracking_error"] = (measured_after - commanded).tolist()
-        record["server_time"] = _wall_time()
-        with self.lock:
-            path = self._demo_dir(request.run_id, request.demo_id) / "action_steps.jsonl"
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record) + "\n")
 
     def chunk_dir(self, run_id: str, demo_id: str, chunk_id: int) -> Path:
         with self.lock:
@@ -240,6 +193,7 @@ class ObservationRecorder:
         chunk_dir: Path,
         normalized_action: torch.Tensor,
         actions: np.ndarray,
+        decoded_images: dict[str, np.ndarray],
     ) -> None:
         payload = {
             "saved_at": _wall_time(),
@@ -252,7 +206,15 @@ class ObservationRecorder:
             "actions": actions.tolist(),
         }
         self.pending.put_nowait(
-            ("model_output", (chunk_dir, normalized_action.detach().cpu().clone(), payload))
+            (
+                "model_output",
+                (
+                    chunk_dir,
+                    normalized_action.detach().cpu().clone(),
+                    payload,
+                    {name: image.copy() for name, image in decoded_images.items()},
+                ),
+            )
         )
 
     def _save_model_output_sync(
@@ -260,18 +222,21 @@ class ObservationRecorder:
         chunk_dir: Path,
         normalized_action: torch.Tensor,
         payload: dict[str, Any],
+        decoded_images: dict[str, np.ndarray],
     ) -> None:
         with self.lock:
             normalized_tmp = chunk_dir / "normalized_model_output.pt.tmp"
             torch.save(normalized_action, normalized_tmp)
             normalized_tmp.replace(chunk_dir / "normalized_model_output.pt")
             self._write_json(chunk_dir / "model_actions.json", payload)
+            for name, image in decoded_images.items():
+                Image.fromarray(image).save(chunk_dir / f"decoded_{name}.png")
 
 
 def _model_dtype(name: str) -> torch.dtype:
     return {"no": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[name]
 
-
+# Decoding/Converting from base64 to RGB
 def _decode_rgb(encoded: str, name: str) -> np.ndarray:
     encoded = encoded.split(",", 1)[-1] if encoded.startswith("data:") else encoded
     try:
@@ -301,7 +266,7 @@ def _resize(image: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
     """Match the existing FastWAM RobotWin deployment's PIL bilinear resize."""
     return np.asarray(Image.fromarray(image).resize(size_wh, Image.BILINEAR), dtype=np.uint8)
 
-
+# Visual input assembled into the 384 * 320 mosaic
 def compose_robotwin_image(head: np.ndarray, left: np.ndarray, right: np.ndarray) -> np.ndarray:
     """Match collection framing, then FastWAM's 3-camera 320x384 layout."""
     head = _center_crop(head, 640, 640)
@@ -311,6 +276,7 @@ def compose_robotwin_image(head: np.ndarray, left: np.ndarray, right: np.ndarray
             "R1 Lite wrist images must remain native 640x360; "
             f"received left={left.shape[1]}x{left.shape[0]}, right={right.shape[1]}x{right.shape[0]}"
         )
+    # Resize to the required layout
     top = _resize(head, (320, 256))
     bottom = np.concatenate((_resize(left, (160, 128)), _resize(right, (160, 128))), axis=1)
     return np.concatenate((top, bottom), axis=0)  # HWC: 384x320x3
@@ -340,6 +306,7 @@ class FastWAMR1LitePolicy:
         if not args.checkpoint.is_file() or not args.dataset_stats.is_file():
             raise FileNotFoundError("Checkpoint and dataset stats must both exist")
 
+        # Model + normalizer loading
         model_cfg = OmegaConf.create(OmegaConf.to_container(self.cfg.model, resolve=True))
         # Use precomputed context embeddings so T5 is not loaded on the
         # inference GPU. The cache is generated by scripts/precompute_text_embeds.py.
@@ -350,10 +317,26 @@ class FastWAMR1LitePolicy:
         self.processor: FastWAMProcessor = instantiate(self.cfg.data.train.processor).eval()
         self.processor.set_normalizer_from_stats(load_dataset_stats_from_json(str(args.dataset_stats)))
         self._validate_contract()
+        action_key = self.processor.shape_meta["action"][0]["key"]
+        action_stats = self.processor.normalizer.normalizers["action"][action_key].get_stats()
+        self.action_min = action_stats["min"].detach().cpu().numpy().astype(np.float32)
+        self.action_max = action_stats["max"].detach().cpu().numpy().astype(np.float32)
+        if self.action_min.shape != (ACTION_DIM,) or self.action_max.shape != (ACTION_DIM,):
+            raise ValueError("Expected 14-D global action min/max in dataset statistics")
+        if not np.isfinite(self.action_min).all() or not np.isfinite(self.action_max).all():
+            raise ValueError("Dataset action min/max contains non-finite values")
+        if np.any(self.action_min > self.action_max):
+            raise ValueError("Dataset action min exceeds action max")
 
         # Training configs do not necessarily define the optional uppercase
         # EVALUATION section used by some evaluation configs.
         evaluation_cfg = self.cfg.get("EVALUATION", {})
+        self.action_semantics = str(evaluation_cfg.get("action_semantics", "relative"))
+        if self.action_semantics not in {"relative", "absolute"}:
+            raise ValueError(
+                "EVALUATION.action_semantics must be 'relative' or 'absolute', "
+                f"got {self.action_semantics!r}"
+            )
         self.action_horizon = int(
             args.action_horizon
             if args.action_horizon is not None
@@ -383,6 +366,7 @@ class FastWAMR1LitePolicy:
         self.num_video_frames = (int(self.cfg.data.train.num_frames) - 1) // int(self.cfg.data.train.action_video_freq_ratio) + 1
         self.lock = threading.Lock()
 
+    # Validating shape of states and actions
     def _validate_contract(self) -> None:
         state_meta, action_meta = self.processor.shape_meta["state"], self.processor.shape_meta["action"]
         if len(state_meta) != 1 or len(action_meta) != 1:
@@ -393,12 +377,14 @@ class FastWAMR1LitePolicy:
         if self.processor.proprio_output_dim != 14 or self.processor.action_output_dim != 14:
             raise ValueError("r1lite processor dimensions must both be 14")
 
+    # Proprio normalization
     def _normalize_state(self, state: np.ndarray) -> torch.Tensor:
         key = self.processor.shape_meta["state"][0]["key"]
         batch = {"state": {key: torch.as_tensor(state, dtype=torch.float32).unsqueeze(0)}}
         batch = self.processor.action_state_transform(batch)
         return self.processor.normalizer.forward(batch)["state"][key]
 
+    # Action denormalization
     def _denormalize_action(self, action: torch.Tensor) -> np.ndarray:
         if action.ndim == 2:
             action = action.unsqueeze(0)
@@ -406,8 +392,12 @@ class FastWAMR1LitePolicy:
             raise ValueError(f"Expected [B,T,D] action, got {tuple(action.shape)}")
         key = self.processor.shape_meta["action"][0]["key"]
         normalizer = self.processor.normalizer.normalizers["action"][key]
-        return normalizer.backward(action.detach().to(device="cpu", dtype=torch.float32)).numpy()
+        denormalized = normalizer.backward(
+            action.detach().to(device="cpu", dtype=torch.float32)
+        ).numpy()
+        return np.clip(denormalized, self.action_min, self.action_max)
 
+    # Load the precomputed T5 embedding cache
     def _load_context(self, task: str) -> tuple[torch.Tensor, torch.Tensor]:
         prompt = DEFAULT_PROMPT.format(task=task)
         digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
@@ -421,16 +411,26 @@ class FastWAMR1LitePolicy:
         context, context_mask = payload["context"], payload["mask"].bool()
         if context.ndim != 2 or context.shape[0] != self.context_len or context_mask.shape != (self.context_len,):
             raise ValueError(f"Invalid cached embedding shape in {cache_path}")
-        return context, context_mask
+
+        # Match RobotVideoDataset._get exactly. Wan's text-conditioning path
+        # receives zero vectors at padding locations and an all-valid mask.
+        # Passing the tokenizer mask from the cache changes cross-attention
+        # relative to training.
+        context = context.clone()
+        context[~context_mask] = 0.0
+        return context, torch.ones_like(context_mask)
 
     def infer(self, request: InferenceRequest) -> np.ndarray:
         state = np.asarray(request.state, dtype=np.float32)
         if not np.isfinite(state).all():
             raise ValueError("state contains non-finite values")
+        decoded_images = {
+            "head": _decode_rgb(request.head_image, "head_image"),
+            "left_wrist": _decode_rgb(request.left_wrist_image, "left_wrist_image"),
+            "right_wrist": _decode_rgb(request.right_wrist_image, "right_wrist_image"),
+        }
         image = compose_robotwin_image(
-            _decode_rgb(request.head_image, "head_image"),
-            _decode_rgb(request.left_wrist_image, "left_wrist_image"),
-            _decode_rgb(request.right_wrist_image, "right_wrist_image"),
+            decoded_images["head"], decoded_images["left_wrist"], decoded_images["right_wrist"]
         )
         image_tensor_cpu = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).to(
             dtype=self.model.torch_dtype
@@ -460,13 +460,16 @@ class FastWAMR1LitePolicy:
         # .pt contains the exact normalized tensors passed to the model.
         recorded_kwargs = dict(kwargs)
         recorded_kwargs["input_image"] = image_tensor_cpu
+        # Chunk saving
         chunk_dir = self.recorder.save_model_input(request, image, recorded_kwargs)
+
         with self.lock, torch.no_grad():
             action = self.model.infer_action(**kwargs)["action"]
         actions = self._denormalize_action(action)[0]
         if actions.shape != (self.action_horizon, ACTION_DIM) or not np.isfinite(actions).all():
             raise RuntimeError(f"Invalid model output: {actions.shape}")
-        self.recorder.save_model_output(chunk_dir, action, actions)
+        # Enqueued only after infer_action returns and the output passes validation.
+        self.recorder.save_model_output(chunk_dir, action, actions, decoded_images)
         return actions
 
 
@@ -484,7 +487,7 @@ def build_app(policy: FastWAMR1LitePolicy) -> FastAPI:
             "action_dim": ACTION_DIM,
             "action_horizon": policy.action_horizon,
             "camera_layout": "center-crop head 640x640; native wrists 640x360; head 320x256 above wrists 160x128",
-            "action_semantics": "[left_arm_delta_6, right_arm_delta_6, left_gripper_absolute, right_gripper_absolute]",
+            "action_semantics": policy.action_semantics,
             "observations_dir": str(policy.recorder.root),
         }
 
@@ -492,17 +495,6 @@ def build_app(policy: FastWAMR1LitePolicy) -> FastAPI:
     def start_run(request: StartRunRequest) -> dict[str, object]:
         run_id = policy.recorder.start_run(request)
         return {"run_id": run_id, "num_demos": request.num_demos}
-
-    @app.post("/runs/event")
-    def log_demo_event(request: DemoEventRequest) -> dict[str, str]:
-        policy.recorder.append_event(request)
-        return {"status": "saved"}
-
-    @app.post("/runs/action-step")
-    def log_action_step(request: ActionStepRequest) -> dict[str, str]:
-        policy.recorder.append_action_step(request)
-        return {"status": "saved"}
-
     @app.post("/infer")
     def infer(request: InferenceRequest) -> dict[str, object]:
         started = time.perf_counter()
@@ -516,7 +508,7 @@ def build_app(policy: FastWAMR1LitePolicy) -> FastAPI:
         return {
             "actions": actions.tolist(),
             "action_horizon": policy.action_horizon,
-            "action_semantics": "[left_arm_delta_6, right_arm_delta_6, left_gripper_absolute, right_gripper_absolute]",
+            "action_semantics": policy.action_semantics,
             "server_timing": {"infer_ms": (time.perf_counter() - started) * 1000.0},
         }
 
@@ -542,7 +534,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--observations-dir",
         type=Path,
-        default=PROJECT_ROOT / "observations",
+        default=PROJECT_ROOT / "server_observations",
         help="Root for run_N/demo_M model-input and execution logs",
     )
     parser.add_argument("--rand-device")
