@@ -24,8 +24,6 @@ done
 set -u
 
 cd "$REPO_ROOT"
-# Keep dated rollout videos and execution traces on the robot itself. The
-# workstation still owns the model process and its temporary model-input files.
+# Keep checkpointed rollout HDF5 files on the robot itself.
 exec python3 experiments/r1lite/inference_r1lite_fastwam.py \
-  --rollouts-dir /home/r1lite/Documents/FastWAM/rollouts/r1lite \
-  --observations-dir /home/r1lite/Documents/FastWAM/observations "$@"
+  --rollouts-dir /home/r1lite/Documents/FastWAM/rollouts/r1lite "$@"

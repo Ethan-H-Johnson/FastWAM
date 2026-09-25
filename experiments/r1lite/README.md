@@ -142,7 +142,7 @@ selection (`--max-observation-age-ms`), and the head frame must be newer than th
 previous request. Publishers must provide valid capture stamps on the same ROS
 clock; zero stamps are rejected with a warning. The client waits if no qualifying
 bundle exists. Selection timestamps and measured spans are logged in the robot's
-demo `events.jsonl`. These limits apply before the blocking model request; they
+`run.hdf5` demo events. These limits apply before the blocking model request; they
 do not eliminate inference latency.
 
 Execution events and action summaries are recorded on the robot. The unused
@@ -164,23 +164,30 @@ At startup the client asks for the number of demos, then creates one robot-local
 session at:
 
 ```text
-rollouts/r1lite/<policy_config>/<YYYYMMDD>/run_<HHMMSS_microseconds>/demo_<N>/
+rollouts/r1lite/<policy_config>/<YYYYMMDD>/run_<HHMMSS_microseconds>/run.hdf5
 ```
 
-Each demo records from its start Enter press through its stop Enter press. It
-writes `trajectory.mp4` as 30 FPS H.264 (`avc1`), `command_feedback.json` with
-the model output, command, pre/post feedback and tracking error for every
-executed action step, and the action summary graph. It does not save per-chunk
-rollout images.
+Each demo begins with a valid synchronized three-camera observation. A single
+background writer stores continuous JPEG camera frames, measured states, held
+targets, executed model actions, feedback, events, command publications, and
+the exact per-query JPEG payloads in the HDF5. The collection viewer can read
+the `data/demo_N` camera and state arrays. Its `actions` array is target minus
+measured state; the original model actions are stored separately under
+`rollout/steps`. Live rollout HDF5 files cannot be passed to `--replay-hdf5`.
 
-Video encoding runs in a background worker; frames are dropped if it falls
-behind rather than delaying inference or control.
+When Enter stops a demo, the robot starts resetting immediately while the
+writer closes and checkpoints the demo. After `Reset finished.`, the client
+prompts for an integer accuracy score from 1 to 100 (input typed during reset
+is ignored); only 100 counts as success. The score and reset result
+are included in a second checkpoint. The next demo starts after reset and both
+checkpoints finish. At the end, the client prints successes divided by the
+number of demos requested at startup, and stores those totals in `run.hdf5`.
 
-Separately, the robot saves the exact JPEG payloads sent in each inference
-request under `observations/run_N/demo_M/images/chunk_K/` as `head.jpg`,
-`left_wrist.jpg`, and `right_wrist.jpg`. This writer also runs in the
-background. The workstation independently saves decoded native PNGs after a
-successful model call under `server_observations/`.
+During recording, `run.inprogress` is the active file and
+`run.checkpoint.tmp` is used for an atomic replacement of `run.hdf5`. Only
+`run.hdf5` is intended for the viewer. A power loss may lose the active demo;
+previously checkpointed demos remain in `run.hdf5`. The workstation still
+saves its independent decoded native images under `server_observations/`.
 
 After verifying state order, gripper units, target limits, and live camera topics:
 
@@ -192,7 +199,7 @@ bash experiments/r1lite/run_r1lite_client.sh \
 
 The client executes at 15 Hz, matching the demonstrations' physical capture rate, and by default executes the complete action horizon returned by the trained server (32 actions for this checkpoint). Pass `--replan-steps N` only to deliberately use a shorter receding horizon.
 
-The client initially waits without querying the server or moving the robot. Press Enter to start inference. Press Enter again to stop, hold the latest measured pose, and run the shared arm/gripper/torso reset back to `initial_robot_position.json`. After reset, press Enter to begin another rollout. `Ctrl-C` is the emergency exit and intentionally skips automatic reset.
+The client initially waits without querying the server or moving the robot. Press Enter to start inference. Press Enter again to stop, hold the latest measured pose, and run the shared arm/gripper/torso reset back to `initial_robot_position.json`. Inference takes the arm/gripper hold back at that reset target. After scoring and checkpointing, press Enter to begin another rollout. `Ctrl-C` is the emergency exit and intentionally skips automatic reset.
 
 ### Neutral-left proprio A/B test
 

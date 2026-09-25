@@ -9,31 +9,31 @@ from __future__ import annotations
 
 import argparse
 import base64
-from collections import deque
-from dataclasses import dataclass
-from datetime import datetime
 import json
 import os
-from pathlib import Path
 import queue
 import re
-import shutil
 import signal
 import subprocess
 import threading
 import time
 import traceback
-from typing import Callable
+from collections import deque
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import cv2
-from cv_bridge import CvBridge
 import h5py
 import numpy as np
 import rclpy
+from cv_bridge import CvBridge
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rollout_hdf5 import HDF5RolloutRecorder
 from sensor_msgs.msg import CompressedImage, Image, JointState
 
 ARM_FEEDBACK_TOPICS = {"left": "/hdas/feedback_arm_left", "right": "/hdas/feedback_arm_right"}
@@ -61,7 +61,6 @@ JOINT_LIMITS_RAD = np.asarray(
     [(-1.20, 0.70), (-0.40, 2.80), (-2.35, 0.40), (-0.80, 1.20), (-0.70, 0.70), (-1.10, 1.30)],
     dtype=np.float32,
 )
-VIDEO_FPS = 30.0
 
 
 def _safe_path_component(value: str) -> str:
@@ -76,7 +75,7 @@ class RolloutSession:
     root: Path
 
     @classmethod
-    def create(cls, rollouts_dir: Path, policy_config: str, metadata: dict[str, object]) -> "RolloutSession":
+    def create(cls, rollouts_dir: Path, policy_config: str) -> RolloutSession:
         now = datetime.now().astimezone()
         root = (
             rollouts_dir.expanduser()
@@ -85,14 +84,7 @@ class RolloutSession:
             / f"run_{now.strftime('%H%M%S_%f')}"
         )
         root.mkdir(parents=True, exist_ok=False)
-        (root / "run.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return cls(root=root)
-
-    def demo_dir(self, demo_id: str) -> Path:
-        path = self.root / demo_id
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
 
 @dataclass(frozen=True)
 class ObservationBundle:
@@ -104,66 +96,15 @@ class ObservationBundle:
     sample_timestamps_s: dict[str, float]
 
 
-class CommandPublishLogger:
-    """Write every ROS target publication without blocking the control thread."""
-
-    def __init__(self, session: RolloutSession) -> None:
-        self.path = session.root / "command_publications.jsonl"
-        self.pending: queue.Queue[dict[str, object] | None] = queue.Queue(maxsize=10000)
-        self.dropped = 0
-        self.worker = threading.Thread(target=self._run, name="command-publish-logger", daemon=True)
-        self.worker.start()
-
-    def submit(
-        self,
-        source: str,
-        target: np.ndarray,
-        demo_id: str | None,
-        chunk_id: int | None,
-        action_step: int | None,
-    ) -> None:
-        record = {
-            "monotonic_ns": time.monotonic_ns(),
-            "wall_time": wall_time(),
-            "source": source,
-            "demo_id": demo_id,
-            "chunk_id": chunk_id,
-            "action_step": action_step,
-            "target": np.asarray(target, dtype=np.float32).tolist(),
-        }
-        try:
-            self.pending.put_nowait(record)
-        except queue.Full:
-            self.dropped += 1
-
-    def _run(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8", buffering=1) as stream:
-            while True:
-                record = self.pending.get()
-                try:
-                    if record is None:
-                        return
-                    stream.write(json.dumps(record, separators=(",", ":")) + "\n")
-                finally:
-                    self.pending.task_done()
-
-    def close(self) -> None:
-        self.pending.join()
-        if self.dropped:
-            print(f"COMMAND_PUBLISH_LOG_DROPPED: {self.dropped}")
-        self.pending.put(None)
-        self.worker.join()
-
-
 class RobotIO(Node):
     def __init__(
         self,
         wrist_transport: str,
         hold_hz: float,
         observation_buffer_s: float,
-        video_recorder: "TrajectoryRecorder",
-        publish_logger: CommandPublishLogger | None = None,
+        rollout_recorder: HDF5RolloutRecorder,
+        max_observation_skew_s: float,
+        max_observation_age_s: float,
     ) -> None:
         super().__init__("r1lite_fastwam_inference")
         self.bridge = CvBridge()
@@ -174,7 +115,10 @@ class RobotIO(Node):
         self._observation_buffer_s = observation_buffer_s
         self._last_observation_stamp = float('-inf')
         self._invalid_stamp_warned: set[str] = set()
-        self.video_recorder = video_recorder
+        self.rollout_recorder = rollout_recorder
+        self._capture_skew_s = max_observation_skew_s
+        self._capture_age_s = max_observation_age_s
+        self._last_rollout_stamp = float("-inf")
         self._samples: dict[str, deque[tuple[float, np.ndarray]]] = {
             "head": deque(),
             "left_wrist": deque(),
@@ -189,7 +133,6 @@ class RobotIO(Node):
         self._hold_enabled = threading.Event()
         self._hold_closed = threading.Event()
         self._hold_hz = hold_hz
-        self._publish_logger = publish_logger
         self._active_demo_id: str | None = None
         self._last_target_chunk_id: int | None = None
         self._last_target_action_step: int | None = None
@@ -271,26 +214,45 @@ class RobotIO(Node):
             self.images[name] = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             timestamp_s = self._message_timestamp_s(message)
             self._append_sample(name, timestamp_s, self.images[name])
-            if name == "head" and timestamp_s > 0.0 and self.video_recorder.active.is_set():
-                try:
-                    frame = self.trajectory_frame()
-                    if frame is not None:
-                        self.video_recorder.submit(timestamp_s, frame)
-                except Exception as exc:  # noqa: BLE001
-                    self.get_logger().warning(f"Could not build trajectory frame: {exc}")
         return callback
 
     def spin_for(self, seconds: float) -> None:
         deadline = time.monotonic() + seconds
         while rclpy.ok() and time.monotonic() < deadline:
             rclpy.spin_once(self, timeout_sec=min(0.01, deadline - time.monotonic()))
+            self.capture_rollout_frame()
+
+    def capture_rollout_frame(self, observation: ObservationBundle | None = None) -> None:
+        if not self.rollout_recorder.recording_frames:
+            return
+        if observation is None:
+            observation = self.synchronized_observation(
+                self._capture_skew_s, self._capture_age_s,
+                after_stamp=self._last_rollout_stamp,
+            )
+        if observation is None or observation.timestamp_s <= self._last_rollout_stamp:
+            return
+        if observation.timestamp_s - self._last_rollout_stamp < 1.0 / 15.0:
+            return
+        self._last_rollout_stamp = observation.timestamp_s
+        held = self.held_targets()
+        target = observation.state if held is None else held
+        self.rollout_recorder.submit_frame(
+            observation.timestamp_s, observation.state, observation.images,
+            observation.sample_timestamps_s, target, held is not None,
+        )
+
+    def reset_rollout_stamp(self) -> None:
+        self._last_rollout_stamp = float("-inf")
 
     def local_state(self) -> np.ndarray:
         if not all(x is not None for x in self.arm.values()) or not all(x is not None for x in self.gripper.values()):
             raise RuntimeError("Robot arm/gripper feedback is incomplete")
         return np.concatenate((self.arm["left"], self.arm["right"], np.asarray([self.gripper["left"], self.gripper["right"]], dtype=np.float32)))
 
-    def synchronized_observation(self, max_skew_s: float, max_age_s: float) -> ObservationBundle | None:
+    def synchronized_observation(
+        self, max_skew_s: float, max_age_s: float, after_stamp: float | None = None,
+    ) -> ObservationBundle | None:
         """Return the newest observation whose full timestamp span is ``max_skew_s``.
 
         A head-camera timestamp is used as the candidate capture time. For every
@@ -304,8 +266,9 @@ class RobotIO(Node):
             return None
 
         now = self.get_clock().now().nanoseconds / 1e9
+        cutoff_stamp = self._last_observation_stamp if after_stamp is None else after_stamp
         for target_time, head in reversed(self._samples["head"]):
-            if target_time <= self._last_observation_stamp:
+            if target_time <= cutoff_stamp:
                 continue
             selected: dict[str, tuple[float, np.ndarray]] = {"head": (target_time, head)}
             for name, samples in self._samples.items():
@@ -342,25 +305,6 @@ class RobotIO(Node):
             raise RuntimeError("Failed to encode camera image")
         return base64.b64encode(encoded.tobytes()).decode("ascii")
 
-    def trajectory_frame(self) -> np.ndarray | None:
-        """Human-readable head-over-wrists frame for the rollout video."""
-        head, left, right = self.images["head"], self.images["left_wrist"], self.images["right_wrist"]
-        if head is None or left is None or right is None:
-            return None
-        if head.shape[0] < 640 or head.shape[1] < 640 or left.shape[:2] != (360, 640) or right.shape[:2] != (360, 640):
-            return None
-        h, w = head.shape[:2]
-        head = head[(h - 640) // 2 : (h + 640) // 2, (w - 640) // 2 : (w + 640) // 2]
-        wrists = np.concatenate(
-            (
-                cv2.resize(left, (320, 180), interpolation=cv2.INTER_AREA),
-                cv2.resize(right, (320, 180), interpolation=cv2.INTER_AREA),
-            ),
-            axis=1,
-        )
-        return np.concatenate((head, wrists), axis=0).copy()
-
-    # Payload for logging
     def make_payload(
         self,
         prompt: str,
@@ -412,7 +356,7 @@ class RobotIO(Node):
         target[12:14] = np.clip(target[12:14], gripper_min, gripper_max)
         return target
 
-    def set_active_demo(self, demo_id: str) -> None:
+    def set_active_demo(self, demo_id: str | None) -> None:
         with self._command_lock:
             self._active_demo_id = demo_id
 
@@ -466,14 +410,15 @@ class RobotIO(Node):
             gripper.header.stamp = stamp
             gripper.position = [float(target[12 + arm_index])]
             self.gripper_publishers[side].publish(gripper)
-        if self._publish_logger is not None:
-            self._publish_logger.submit(
-                source,
-                target,
-                self._active_demo_id,
-                self._last_target_chunk_id,
-                self._last_target_action_step,
-            )
+        self.rollout_recorder.submit_publication({
+            "monotonic_ns": time.monotonic_ns(),
+            "wall_time": wall_time(),
+            "source": source,
+            "demo_id": self._active_demo_id,
+            "chunk_id": self._last_target_chunk_id,
+            "action_step": self._last_target_action_step,
+            "target": target.tolist(),
+        })
 
     def publish_targets(self, target: np.ndarray) -> None:
         target = np.asarray(target, dtype=np.float32).copy()
@@ -551,32 +496,104 @@ class RobotIO(Node):
         self._hold_thread.join()
 
 
-class EnterHotkey:
-    """Toggle inference from a background stdin reader."""
+class OperatorInput:
+    """Sole stdin reader for demo toggles and scores."""
 
     def __init__(self, on_stop: Callable[[], object] | None = None) -> None:
         self.on_stop = on_stop
         self.running = threading.Event()
         self.closed = threading.Event()
+        self.stop_handled = threading.Event()
+        self._lock = threading.Lock()
+        self._mode = "idle"
+        self._scores: queue.Queue[int] = queue.Queue()
         self.worker = threading.Thread(target=self._run, daemon=True)
         self.worker.start()
 
     def _run(self) -> None:
         while not self.closed.is_set():
             try:
-                input()
+                line = input()
             except EOFError:
+                self.closed.set()
                 return
             if self.closed.is_set():
                 return
-            if self.running.is_set():
-                self.running.clear()
-                if self.on_stop is not None:
-                    self.on_stop()
-                print("\nSTOP requested. Holding latest feedback, then resetting.")
-            else:
-                self.running.set()
-                print("\nSTART requested.")
+            stop = False
+            with self._lock:
+                if self._mode == "idle":
+                    self._mode = "arming"
+                    self.running.set()
+                    self.stop_handled.clear()
+                    print("\nSTART requested.")
+                elif self._mode == "arming":
+                    self._mode = "idle"
+                    self.running.clear()
+                    print("\nStart cancelled before a synchronized frame was available.")
+                elif self._mode == "recording":
+                    self._mode = "resetting"
+                    self.running.clear()
+                    stop = True
+                elif self._mode == "resetting":
+                    print("Reset in progress; enter the score after it finishes.")
+                elif self._mode == "scoring":
+                    value = line.strip()
+                    if value.isdecimal() and 1 <= int(value) <= 100:
+                        self._scores.put(int(value))
+                        self._mode = "busy"
+                        print(f"Accuracy score: {value}/100")
+                    else:
+                        print("Enter a whole-number accuracy score from 1 to 100: ", end="", flush=True)
+                else:
+                    print("Finishing reset and rollout checkpoint; input ignored.")
+            if stop:
+                self._finish_stop()
+
+    def _finish_stop(self) -> None:
+        try:
+            if self.on_stop is not None:
+                self.on_stop()
+        finally:
+            self.stop_handled.set()
+        print("\nSTOP requested. Holding latest feedback, then resetting.")
+
+    def request_score(self) -> None:
+        """Open score entry once reset output is done, so the prompt stays visible."""
+        with self._lock:
+            if self._mode != "resetting":
+                raise RuntimeError(f"Cannot request a score while input is {self._mode}")
+            self._mode = "scoring"
+            print("Enter a whole-number accuracy score from 1 to 100: ", end="", flush=True)
+
+    def request_stop(self) -> None:
+        with self._lock:
+            if self._mode != "recording":
+                return
+            self._mode = "resetting"
+            self.running.clear()
+        self._finish_stop()
+
+    def mark_recording(self, on_start: Callable[[], None]) -> bool:
+        with self._lock:
+            if self._mode != "arming" or not self.running.is_set():
+                return False
+            on_start()
+            self._mode = "recording"
+            return True
+
+    def enable_start(self) -> None:
+        with self._lock:
+            if self._mode not in ("busy", "idle"):
+                raise RuntimeError("Cannot accept a new demo before scoring")
+            self._mode = "idle"
+
+    def wait_for_score(self) -> int:
+        while not self.closed.is_set():
+            try:
+                return self._scores.get(timeout=0.1)
+            except queue.Empty:
+                continue
+        raise RuntimeError("Score input closed")
 
     def close(self) -> None:
         self.closed.set()
@@ -587,11 +604,18 @@ def reset_to_initial_position(robot: RobotIO, execute: bool) -> None:
     if not RESET_SCRIPT.is_file():
         raise FileNotFoundError(f"Reset script not found: {RESET_SCRIPT}")
 
+    target_file = Path(os.environ.get(
+        "R1LITE_INITIAL_POSITION_FILE", str(RESET_SCRIPT.parent / "initial_robot_position.json")
+    )).expanduser()
+    reset_target = np.asarray(json.loads(target_file.read_text(encoding="utf-8"))["position"], dtype=np.float32)
+    if reset_target.shape != (18,) or not np.isfinite(reset_target).all():
+        raise ValueError(f"Expected an 18-D finite reset target in {target_file}")
+
     command = ["bash", str(RESET_SCRIPT)]
     print(f"Running reset script: {RESET_SCRIPT}")
     if not execute:
         subprocess.run(command, check=True)
-        print("Reset finished. Press Enter to start inference again.")
+        print("Reset finished.")
         return
 
     handoff_pose = robot.held_targets()
@@ -633,7 +657,7 @@ def reset_to_initial_position(robot: RobotIO, execute: bool) -> None:
 
         wait_for_marker("RESET_HOLDING_FINAL")
         robot.spin_for(0.2)
-        robot.publish_targets(robot.local_state())
+        robot.publish_targets(reset_target[:ACTION_DIM])
         robot.start_hold()
         inference_has_control = True
         process.send_signal(signal.SIGINT)
@@ -653,7 +677,7 @@ def reset_to_initial_position(robot: RobotIO, execute: bool) -> None:
         if process.returncode not in (0, -signal.SIGINT):
             raise subprocess.CalledProcessError(process.returncode, command)
 
-    print("Reset finished. Press Enter to start inference again.")
+    print("Reset finished.")
 
 
 def wall_time() -> str:
@@ -668,7 +692,7 @@ def post_json(endpoint: str, payload: dict[str, object], timeout_s: float) -> di
         method="POST",
     )
     try:
-        with urlopen(request, timeout=timeout_s) as response:  # noqa: S310 - explicit CLI server
+        with urlopen(request, timeout=timeout_s) as response:
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         raise RuntimeError(f"Policy server HTTP {exc.code}: {exc.read().decode(errors='replace')}") from exc
@@ -686,283 +710,6 @@ def ask_num_demos() -> int:
         if value > 0:
             return value
         print("Enter a positive whole number.")
-
-
-class ActionStepLogger:
-    """Persist execution traces on the robot without blocking control."""
-
-    def __init__(self, session: RolloutSession) -> None:
-        self.session = session
-        self.pending: queue.Queue[dict[str, object] | None] = queue.Queue()
-        self.records: dict[tuple[str, str], list[dict[str, object]]] = {}
-        self.feedback_records: dict[tuple[str, str], list[dict[str, object]]] = {}
-        self.records_lock = threading.Lock()
-        self.worker = threading.Thread(target=self._run, daemon=True)
-        self.worker.start()
-
-    def submit(self, record: dict[str, object]) -> None:
-        self.pending.put_nowait(record)
-
-    def _run(self) -> None:
-        while True:
-            record = self.pending.get()
-            try:
-                if record is None:
-                    return
-                demo_dir = self.session.demo_dir(str(record["demo_id"]))
-                measured_before = np.asarray(record["measured_before"], dtype=np.float32)
-                target = np.asarray(record.pop("commanded_target"), dtype=np.float32)
-                after = np.asarray(record.pop("measured_after"), dtype=np.float32)
-                action = np.asarray(record.pop("model_action"), dtype=np.float32)
-                summary = {
-                    "step": int(record["action_step"]),
-                    "chunk": int(record["chunk_id"]),
-                    "target": np.round(target, 3).tolist(),
-                    "measured": np.round(after, 3).tolist(),
-                    "error": np.round(target - after, 3).tolist(),
-                    "model_arm_output": np.round(action[:12], 3).tolist(),
-                    "action_mode": str(record["action_mode"]),
-                }
-                feedback = {
-                    "chunk_id": int(record["chunk_id"]),
-                    "action_step": int(record["action_step"]),
-                    "client_time": str(record["client_time"]),
-                    "model_action": action.tolist(),
-                    "action_mode": str(record["action_mode"]),
-                    "commanded_position": target.tolist(),
-                    "measured_before": measured_before.tolist(),
-                    "measured_after": after.tolist(),
-                    "delta_error": (after - target).tolist(),
-                    "published": bool(record["published"]),
-                    "tick_duration_s": float(record["tick_duration_s"]),
-                    "convergence_enabled": bool(record.get("convergence_enabled", False)),
-                    "settled": record.get("settled"),
-                    "settle_elapsed_s": float(record.get("settle_elapsed_s", 0.0)),
-                    "right_arm_max_error_rad": (
-                        None
-                        if record.get("right_arm_max_error_rad") is None
-                        else float(record["right_arm_max_error_rad"])
-                    ),
-                }
-                key = (str(record["run_id"]), str(record["demo_id"]))
-                with self.records_lock:
-                    self.records.setdefault(key, []).append(summary)
-                    self.feedback_records.setdefault(key, []).append(feedback)
-                    summaries = list(self.records[key])
-                    feedback_steps = list(self.feedback_records[key])
-                (demo_dir / "action_summary.json").write_text(
-                    json.dumps({"steps": summaries}, separators=(",", ":")) + "\n", encoding="utf-8"
-                )
-                (demo_dir / "command_feedback.json").write_text(
-                    json.dumps({"steps": feedback_steps}, indent=2) + "\n",
-                    encoding="utf-8",
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(f"ACTION_LOG_FAILED: {exc}")
-            finally:
-                self.pending.task_done()
-
-    def close(self) -> None:
-        self.pending.join()
-        with self.records_lock:
-            grouped = {key: list(value) for key, value in self.records.items()}
-        for (run_id, demo_id), summaries in grouped.items():
-            self._write_graph(demo_id, summaries)
-        self.pending.put(None)
-        self.worker.join()
-
-    def _write_graph(self, demo_id: str, summaries: list[dict[str, object]]) -> None:
-        if not summaries:
-            return
-        targets = np.asarray([s["target"] for s in summaries], dtype=np.float32)
-        measured = np.asarray([s["measured"] for s in summaries], dtype=np.float32)
-        canvas = np.full((1640, 1400, 3), 255, dtype=np.uint8)
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        cv2.putText(canvas, "Target: blue line | measured: orange dots | x: executed action step", (40, 32), font, 0.7, (0, 0, 0), 2)
-        names = [f"Left joint {i + 1} (rad)" for i in range(6)] + [f"Right joint {i + 1} (rad)" for i in range(6)] + ["Left gripper (native units)", "Right gripper (native units)"]
-        for dim, name in enumerate(names):
-            # Separate dimensions keep gripper units from hiding arm errors.
-            row, col = divmod(dim, 2)
-            x0, y0 = 85 + col * 700, 90 + row * 220
-            x1, y1 = x0 + 570, y0 + 140
-            both = np.concatenate((targets[:, dim], measured[:, dim]))
-            margin = max(float(np.ptp(both)) * 0.05, 0.001)
-            lo, hi = float(both.min()) - margin, float(both.max()) + margin
-            cv2.putText(canvas, name, (x0, y0 - 15), font, 0.55, (0, 0, 0), 1)
-            cv2.rectangle(canvas, (x0, y0), (x1, y1), (100, 100, 100), 1)
-            cv2.putText(canvas, f"{hi:.3f}", (x0 - 80, y0 + 8), font, 0.4, (0, 0, 0), 1)
-            cv2.putText(canvas, f"{lo:.3f}", (x0 - 80, y1), font, 0.4, (0, 0, 0), 1)
-            for values, color, dots in ((targets, (200, 80, 20), False), (measured, (0, 130, 230), True)):
-                points = np.asarray([
-                    (x0 + int(i * (x1 - x0) / max(len(summaries) - 1, 1)),
-                     y1 - int((float(value) - lo) * (y1 - y0) / (hi - lo)))
-                    for i, value in enumerate(values[:, dim])
-                ], dtype=np.int32)
-                if not dots:
-                    cv2.polylines(canvas, [points], False, color, 2)
-                if dots or len(points) == 1:
-                    for point in points:
-                        cv2.circle(canvas, tuple(point), 2, color, -1)
-            cv2.putText(canvas, "1", (x0, y1 + 20), font, 0.4, (0, 0, 0), 1)
-            cv2.putText(canvas, str(len(summaries)), (x1 - 30, y1 + 20), font, 0.4, (0, 0, 0), 1)
-        out = self.session.demo_dir(demo_id) / "action_summary.png"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(out), canvas)
-
-
-class ObservationImageLogger:
-    """Save the exact JPEG camera payloads sent to the server in the background."""
-
-    IMAGE_FIELDS = {
-        "head_image": "head.jpg",
-        "left_wrist_image": "left_wrist.jpg",
-        "right_wrist_image": "right_wrist.jpg",
-    }
-
-    def __init__(self, observations_dir: Path) -> None:
-        self.observations_dir = observations_dir.expanduser()
-        self.pending: queue.Queue[tuple[str, str, int, dict[str, object]] | None] = queue.Queue()
-        self.worker = threading.Thread(target=self._run, daemon=True)
-        self.worker.start()
-
-    def submit(self, run_id: str, demo_id: str, chunk_id: int, payload: dict[str, object]) -> None:
-        self.pending.put_nowait((run_id, demo_id, chunk_id, payload.copy()))
-
-    def _run(self) -> None:
-        while True:
-            item = self.pending.get()
-            try:
-                if item is None:
-                    return
-                run_id, demo_id, chunk_id, payload = item
-                out = self.observations_dir / run_id / demo_id / "images" / f"chunk_{chunk_id:04d}"
-                out.mkdir(parents=True, exist_ok=True)
-                for field, filename in self.IMAGE_FIELDS.items():
-                    (out / filename).write_bytes(base64.b64decode(str(payload[field]), validate=True))
-            except Exception as exc:  # noqa: BLE001
-                print(f"OBSERVATION_IMAGE_LOG_FAILED: {exc}")
-            finally:
-                self.pending.task_done()
-
-    def close(self) -> None:
-        self.pending.join()
-        self.pending.put(None)
-        self.worker.join()
-
-
-class TrajectoryRecorder:
-    """Encode the rollout mosaic as H.264/avc1 without blocking ROS callbacks."""
-
-    def __init__(self) -> None:
-        self.pending: queue.Queue[tuple[str, object] | None] = queue.Queue(maxsize=180)
-        self.active = threading.Event()
-        self.dropped_frames = 0
-        self._current_demo_dir: Path | None = None
-        self.worker = threading.Thread(target=self._run, daemon=True)
-        self.worker.start()
-
-    def start_demo(self, demo_dir: Path) -> None:
-        self.dropped_frames = 0
-        self.active.set()
-        self.pending.put(("start", demo_dir))
-
-    def submit(self, timestamp_s: float, frame: np.ndarray) -> None:
-        if not self.active.is_set():
-            return
-        try:
-            self.pending.put_nowait(("frame", (timestamp_s, frame)))
-        except queue.Full:
-            self.dropped_frames += 1
-
-    def stop_demo(self) -> None:
-        if self.active.is_set():
-            self.active.clear()
-            self.pending.put(("stop", None))
-
-    def _run(self) -> None:
-        process: subprocess.Popen[bytes] | None = None
-        last_frame: np.ndarray | None = None
-        next_frame_time: float | None = None
-        encoding_disabled = False
-
-        def close_process() -> None:
-            nonlocal process, last_frame, next_frame_time
-            if process is not None:
-                try:
-                    if last_frame is not None:
-                        process.stdin.write(cv2.cvtColor(last_frame, cv2.COLOR_RGB2BGR).tobytes())  # type: ignore[union-attr]
-                    process.stdin.close()  # type: ignore[union-attr]
-                    process.wait(timeout=20)
-                except Exception as exc:  # noqa: BLE001
-                    print(f"VIDEO_ENCODE_FAILED: {exc}")
-                    if process.poll() is None:
-                        process.kill()
-            process, last_frame, next_frame_time = None, None, None
-
-        while True:
-            item = self.pending.get()
-            try:
-                if item is None:
-                    close_process()
-                    return
-                operation, value = item
-                if operation == "start":
-                    close_process()
-                    self._current_demo_dir = value  # type: ignore[assignment]
-                    encoding_disabled = False
-                    continue
-                if operation == "stop":
-                    close_process()
-                    continue
-                timestamp_s, frame = value  # type: ignore[misc]
-                if encoding_disabled:
-                    continue
-                if process is None:
-                    ffmpeg = shutil.which("ffmpeg")
-                    if ffmpeg is None:
-                        print("VIDEO_ENCODE_FAILED: ffmpeg is not installed; trajectory.mp4 was not written")
-                        encoding_disabled = True
-                        continue
-                    height, width = frame.shape[:2]
-                    assert self._current_demo_dir is not None
-                    output = self._current_demo_dir / "trajectory.mp4"
-                    process = subprocess.Popen(
-                        [ffmpeg, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}", "-r", str(VIDEO_FPS), "-i", "-", "-an", "-c:v", "libx264", "-tag:v", "avc1", "-pix_fmt", "yuv420p", str(output)],
-                        stdin=subprocess.PIPE,
-                    )
-                    assert process.stdin is not None
-                    process.stdin.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR).tobytes())
-                    last_frame = frame
-                    next_frame_time = float(timestamp_s) + 1.0 / VIDEO_FPS
-                    continue
-                assert process is not None and process.stdin is not None and next_frame_time is not None
-                while last_frame is not None and next_frame_time <= timestamp_s:
-                    process.stdin.write(cv2.cvtColor(last_frame, cv2.COLOR_RGB2BGR).tobytes())
-                    next_frame_time += 1.0 / VIDEO_FPS
-                last_frame = frame
-            except Exception as exc:  # noqa: BLE001
-                print(f"VIDEO_ENCODE_FAILED: {exc}")
-            finally:
-                self.pending.task_done()
-
-    def close(self) -> None:
-        self.stop_demo()
-        self.pending.join()
-        self.pending.put(None)
-        self.worker.join()
-
-
-class ClientObservationRecorder:
-    """Synchronous low-rate event recorder rooted on the robot filesystem."""
-
-    def __init__(self, session: RolloutSession) -> None:
-        self.session = session
-
-    def append_event(self, demo_id: str, event: str, details: dict[str, object] | None = None) -> None:
-        demo_dir = self.session.demo_dir(demo_id)
-        record = {"event": event, "client_time": wall_time(), "details": details or {}}
-        with (demo_dir / "events.jsonl").open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(record, separators=(",", ":")) + "\n")
 
 
 def request_actions(
@@ -1004,7 +751,7 @@ def request_actions_while_spinning(
             result_queue.put(
                 (request_actions(endpoint, payload, timeout_s, expected_action_mode), None)
             )
-        except BaseException as exc:  # Propagate the original request failure on the main thread.
+        except BaseException as exc:  # noqa: BLE001 - propagate worker failure on the main thread
             result_queue.put((None, exc))
 
     worker = threading.Thread(target=infer, name="fastwam-inference-request", daemon=True)
@@ -1033,6 +780,11 @@ def load_replay_actions(path: Path, demo_name: str) -> tuple[np.ndarray, np.ndar
     """
     demo_name = demo_name if demo_name.startswith("demo_") else f"demo_{demo_name}"
     with h5py.File(path, "r") as file:
+        if file.attrs.get("schema_kind") == "fastwam_live_rollout_v1":
+            raise ValueError(
+                "Live rollout HDF5 files use viewer target-minus-state actions and cannot be "
+                "replayed as collection demonstrations"
+            )
         key = f"data/{demo_name}"
         if key not in file:
             available = sorted(file.get("data", {}).keys())
@@ -1060,7 +812,7 @@ def load_replay_actions(path: Path, demo_name: str) -> tuple[np.ndarray, np.ndar
 
 def move_to_replay_start(
     robot: RobotIO,
-    hotkey: EnterHotkey,
+    hotkey: OperatorInput,
     target: np.ndarray,
     args: argparse.Namespace,
 ) -> bool:
@@ -1183,12 +935,6 @@ def parse_args() -> argparse.Namespace:
         help="Robot-local root for dated FastWAM rollout sessions",
     )
     parser.add_argument(
-        "--observations-dir",
-        type=Path,
-        default=Path(__file__).resolve().parents[2] / "observations",
-        help="Robot-local root for exact per-query camera payloads",
-    )
-    parser.add_argument(
         "--policy-config",
         default="fastwam",
         help="Directory name identifying the served FastWAM policy/config",
@@ -1245,29 +991,26 @@ def main() -> None:
             f"{len(replay_actions)} actions; mode={args.replay_mode}"
         )
     num_demos = ask_num_demos()
-    session = RolloutSession.create(
-        args.rollouts_dir,
-        args.policy_config,
-        {
-            "policy_config": args.policy_config,
-            "prompt": args.prompt,
-            "num_demos": num_demos,
-            "execute": args.execute,
-            "control_hz": args.control_hz,
-            "wait_for_convergence": args.wait_for_convergence,
-            "settle_tolerance_deg": args.settle_tolerance_deg,
-            "settle_timeout_s": args.settle_timeout_s,
-            "settle_consecutive_samples": args.settle_consecutive_samples,
-            "max_observation_skew_ms": args.max_observation_skew_ms,
-            "max_observation_age_ms": args.max_observation_age_ms,
-            "created_at": wall_time(),
-            "host": os.uname().nodename,
-            "replay_hdf5": str(args.replay_hdf5) if args.replay_hdf5 else None,
-            "replay_demo": args.replay_demo if args.replay_hdf5 else None,
-        },
-    )
+    run_metadata = {
+        "policy_config": args.policy_config,
+        "prompt": args.prompt,
+        "num_demos": num_demos,
+        "execute": args.execute,
+        "control_hz": args.control_hz,
+        "wait_for_convergence": args.wait_for_convergence,
+        "settle_tolerance_deg": args.settle_tolerance_deg,
+        "settle_timeout_s": args.settle_timeout_s,
+        "settle_consecutive_samples": args.settle_consecutive_samples,
+        "max_observation_skew_ms": args.max_observation_skew_ms,
+        "max_observation_age_ms": args.max_observation_age_ms,
+        "created_at": wall_time(),
+        "host": os.uname().nodename,
+        "replay_hdf5": str(args.replay_hdf5) if args.replay_hdf5 else None,
+        "replay_demo": args.replay_demo if args.replay_hdf5 else None,
+    }
+    session = RolloutSession.create(args.rollouts_dir, args.policy_config)
     if args.replay_hdf5 is not None:
-        run_id = f"replay_{_safe_path_component(args.replay_demo)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        run_id = f"replay_{_safe_path_component(args.replay_demo)}_{datetime.now().astimezone().strftime('%Y%m%d_%H%M%S')}"
     else:
         run_response = post_json(
             server + "/runs/start",
@@ -1280,20 +1023,23 @@ def main() -> None:
             args.request_timeout,
         )
         run_id = str(run_response["run_id"])
-    observation_recorder = ClientObservationRecorder(session)
-    publish_logger = CommandPublishLogger(session)
+    run_metadata["run_id"] = run_id
     action_queue: deque[tuple[int, int, np.ndarray]] = deque()
     rclpy.init()
-    video_recorder = TrajectoryRecorder()
-    robot = RobotIO(
-        args.wrist_transport,
-        max(args.control_hz, 20.0),
-        args.observation_buffer_s,
-        video_recorder,
-        publish_logger,
-    )
-    step_logger = ActionStepLogger(session)
-    image_logger = ObservationImageLogger(args.observations_dir)
+    recorder = HDF5RolloutRecorder(session.root, run_metadata, num_demos)
+    try:
+        robot = RobotIO(
+            args.wrist_transport,
+            max(args.control_hz, 20.0),
+            args.observation_buffer_s,
+            recorder,
+            args.max_observation_skew_ms / 1000.0,
+            args.max_observation_age_ms / 1000.0,
+        )
+    except Exception:
+        recorder.close()
+        rclpy.shutdown()
+        raise
     print("EXECUTE ENABLED" if args.execute else "DRY RUN: add --execute to move the robot")
     replan_description = args.replan_steps if args.replan_steps is not None else "full trained horizon"
     if args.replay_hdf5 is not None:
@@ -1312,25 +1058,39 @@ def main() -> None:
     print(f"Recording {num_demos} demos under {session.root}.")
     print("Press Enter to start demo_1. Press Enter again to stop and reset.")
 
-    hotkey = EnterHotkey(on_stop=robot.hold_current_feedback if args.execute else None)
+    def on_stop() -> None:
+        recorder.stop_frames()
+        robot.set_active_demo(None)
+        if args.execute:
+            robot.hold_current_feedback()
+
+    hotkey = OperatorInput(on_stop=on_stop)
     inference_started = False
     completed_demos = 0
+    success_count = 0
     chunk_id = 0
     replay_index = 0
+    first_checkpoint = None
 
     def current_demo_id() -> str:
         return f"demo_{completed_demos + 1}"
 
     def log_event(event: str, details: dict[str, object] | None = None) -> None:
-        observation_recorder.append_event(current_demo_id(), event, details)
+        recorder.submit_event(current_demo_id(), {
+            "event": event, "client_time": wall_time(), "details": details or {},
+        })
 
     try:
         while rclpy.ok():
+            if hotkey.closed.is_set():
+                raise EOFError("Operator input closed before the run completed")
             if not hotkey.running.is_set():
                 action_queue.clear()
                 if inference_started:
-                    video_recorder.stop_demo()
+                    hotkey.stop_handled.wait()
                     log_event("demo_stopped", {"chunks_queried": chunk_id})
+                    demo_id = current_demo_id()
+                    first_checkpoint = recorder.seal_demo(demo_id, time.time())
                     reset_ok = False
                     for attempt in (1, 2):
                         try:
@@ -1346,24 +1106,52 @@ def main() -> None:
                     if not reset_ok:
                         print(
                             "Automatic reset failed twice; holding last feedback instead of "
-                            "resetting. Press Enter to try starting inference again."
+                            "resetting. Scoring and checkpointing this demo before another start."
                         )
-                    log_event("reset_finished" if reset_ok else "reset_failed")
+                    recorder.stop_publications()
+                    recorder.submit_post_event(demo_id, {
+                        "event": "reset_finished" if reset_ok else "reset_failed",
+                        "client_time": wall_time(), "details": {},
+                    })
+                    hotkey.request_score()
+                    score = hotkey.wait_for_score()
+                    first_checkpoint.wait()
+                    final_checkpoint = recorder.finalize_demo(demo_id, score, reset_ok)
+                    final_checkpoint.wait()
+                    first_checkpoint = None
+                    success_count += int(score == 100)
                     inference_started = False
                     completed_demos += 1
                     if completed_demos >= num_demos:
                         print(f"Completed requested {num_demos} demos in {run_id}.")
+                        print(f"Success rate: {success_count}/{num_demos} = {100.0 * success_count / num_demos:.1f}%")
                         break
+                    hotkey.enable_start()
                     print(f"Press Enter to start {current_demo_id()}.")
                 robot.spin_for(0.05)
                 continue
 
             if not inference_started:
+                robot.spin_for(0.05)
+                initial_observation = robot.synchronized_observation(
+                    args.max_observation_skew_ms / 1000.0,
+                    args.max_observation_age_ms / 1000.0,
+                    after_stamp=float("-inf"),
+                )
+                if initial_observation is None:
+                    continue
+
+                def start_demo(observation: ObservationBundle = initial_observation) -> None:
+                    robot.set_active_demo(current_demo_id())
+                    recorder.begin_demo(current_demo_id(), args.prompt, args.control_hz, time.time())
+                    robot.reset_rollout_stamp()
+                    robot.capture_rollout_frame(observation)
+                    log_event("demo_started")
+
+                if not hotkey.mark_recording(start_demo):
+                    continue
                 inference_started = True
                 chunk_id = 0
-                robot.set_active_demo(current_demo_id())
-                video_recorder.start_demo(session.demo_dir(current_demo_id()))
-                log_event("demo_started")
                 print(f"{current_demo_id()} inference started.")
                 if args.replay_hdf5 is not None:
                     replay_index = 0
@@ -1378,7 +1166,7 @@ def main() -> None:
                     print("Replay demo exhausted; stopping.")
                     if args.execute:
                         robot.hold_current_feedback()
-                    hotkey.running.clear()
+                    hotkey.request_stop()
                     continue
                 chunk_id += 1
                 chunk = replay_actions[replay_index : replay_index + n_execute]
@@ -1405,15 +1193,20 @@ def main() -> None:
                 chunk_id += 1
                 started = time.monotonic()
                 payload = robot.make_payload(args.prompt, run_id, current_demo_id(), chunk_id, observation)
-                image_logger.submit(run_id, current_demo_id(), chunk_id, payload)
+                if not hotkey.running.is_set():
+                    continue
+                recorder.submit_query(
+                    current_demo_id(), chunk_id, payload, observation.sample_timestamps_s,
+                )
                 robot._last_observation_stamp = observation.timestamp_s
                 log_event("observation_selected", {
                     "chunk_id": chunk_id, "timestamps_s": observation.sample_timestamps_s,
                     "span_ms": 1000.0 * (max(observation.sample_timestamps_s.values()) - min(observation.sample_timestamps_s.values())),
                 })
-                if args.execute and robot.held_targets() is None:
-                    if not robot.hold_current_feedback():
-                        raise RuntimeError("Could not establish the initial hold target before inference")
+                if args.execute and robot.held_targets() is None and not robot.hold_current_feedback():
+                    raise RuntimeError("Could not establish the initial hold target before inference")
+                if not hotkey.running.is_set():
+                    continue
                 actions = request_actions_while_spinning(
                     robot,
                     endpoint,
@@ -1479,15 +1272,13 @@ def main() -> None:
                     tolerance_rad=np.deg2rad(args.settle_tolerance_deg),
                     consecutive_samples=args.settle_consecutive_samples,
                 )
-                if not hotkey.running.is_set():
-                    action_queue.clear()
-                    continue
             else:
                 remaining = period - (time.monotonic() - tick_started)
                 if remaining > 0:
                     robot.spin_for(remaining)
             measured_after = robot.local_state().copy()
-            step_logger.submit(
+            recorder.submit_step(
+                current_demo_id(),
                 {
                     "run_id": run_id,
                     "demo_id": current_demo_id(),
@@ -1495,7 +1286,7 @@ def main() -> None:
                     "action_step": action_step,
                     "client_time": wall_time(),
                     "model_action": action.tolist(),
-                    "action_mode": args.action_mode,
+                    "action_mode": args.replay_mode if args.replay_hdf5 is not None else args.action_mode,
                     "measured_before": measured_before.tolist(),
                     "commanded_target": target.tolist(),
                     "measured_after": measured_after.tolist(),
@@ -1511,27 +1302,54 @@ def main() -> None:
         print("\nEmergency exit requested; automatic reset is skipped.")
         if inference_started:
             try:
-                log_event("emergency_exit", {"chunks_queried": chunk_id})
+                recorder.stop_frames()
+                robot.set_active_demo(None)
+                if args.execute:
+                    robot.hold_current_feedback()
+                if recorder.phase in ("recording", "stopping"):
+                    log_event("emergency_exit", {"chunks_queried": chunk_id})
+                    interrupted_checkpoint = recorder.seal_demo(current_demo_id(), time.time())
+                    interrupted_checkpoint.wait()
+                if recorder.phase == "sealing":
+                    if first_checkpoint is not None:
+                        first_checkpoint.wait()
+                    recorder.finalize_demo(current_demo_id(), None, None).wait()
             except Exception as exc:  # noqa: BLE001
-                print(f"EVENT_LOG_FAILED: {exc}")
+                print(f"INTERRUPTED_ROLLOUT_CHECKPOINT_FAILED: {exc}")
         failed = False
     except Exception:  # noqa: BLE001
         traceback.print_exc()
         print("\nUnhandled error in the control loop; exiting.")
+        if inference_started:
+            try:
+                recorder.stop_frames()
+                robot.set_active_demo(None)
+                if args.execute:
+                    robot.hold_current_feedback()
+                if recorder.phase in ("recording", "stopping"):
+                    log_event("interrupted_by_error", {"chunks_queried": chunk_id})
+                    recorder.seal_demo(current_demo_id(), time.time()).wait()
+                if recorder.phase == "sealing":
+                    if first_checkpoint is not None:
+                        first_checkpoint.wait()
+                    recorder.finalize_demo(current_demo_id(), None, None).wait()
+            except Exception as exc:  # noqa: BLE001
+                print(f"INTERRUPTED_ROLLOUT_CHECKPOINT_FAILED: {exc}")
         failed = True
     else:
         failed = False
     finally:
         hotkey.close()
         robot.close()
-        publish_logger.close()
-        video_recorder.close()
-        step_logger.close()
-        image_logger.close()
+        try:
+            recorder.close(completed=completed_demos == num_demos and not failed)
+        except Exception as exc:  # noqa: BLE001
+            print(f"ROLLOUT_CLOSE_FAILED: {exc}")
+            failed = True
         robot.destroy_node()
         rclpy.shutdown()
 
-    # EnterHotkey's daemon may still be blocked in input() while holding
+    # OperatorInput's daemon may still be blocked in input() while holding
     # stdin's internal lock, so exit directly after all cleanup is complete.
     os._exit(1 if failed else 0)
 
